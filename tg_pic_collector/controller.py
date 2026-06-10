@@ -1,0 +1,617 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from PySide6.QtCore import QObject
+from PySide6.QtGui import QDesktopServices
+from qfluentwidgets import Theme, setTheme
+
+from .config import AppConfig
+from .models import PreviewRequest, SAVE_MODE_LABELS, ScanRequest, TelegramCredentials
+from .telegram_worker import TelegramWorker
+from .ui import HistoryRow, MainWindow, TaskRow
+
+
+class AppController(QObject):
+    """Connects the pure UI layer to configuration and Telegram services."""
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.window = MainWindow()
+        self.worker: TelegramWorker | None = None
+        self.authorized = False
+        self.current_request: ScanRequest | None = None
+        self.current_open_after = False
+        self.cancelled = False
+        self.queue: list[TaskRow] = []
+
+        self._populate_ui()
+        self._connect_ui()
+        self._refresh_local_data()
+        self._ensure_worker(quiet=True)
+
+    def _populate_ui(self) -> None:
+        task_modes = [("default", "沿用默认设置"), *SAVE_MODE_LABELS.items()]
+        for key, label in task_modes:
+            self.window.task_page.add_mode_item(label, key)
+        self.window.set_task_defaults(
+            self.config.save_root,
+            SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
+            self.config.save_mode if self.config.use_last_mode else "default",
+        )
+        if self.config.restore_on_launch:
+            self.window.task_page.channel_edit.setText(self.config.channel)
+            self.window.task_page.tag_edit.setText(self.config.tag)
+        if self.config.auto_fill_tag and not self.window.task_page.tag_edit.text() and self.config.history:
+            recent_tag = str(self.config.history[0].get("tag", "")).strip()
+            if recent_tag:
+                self.window.task_page.tag_edit.setText(recent_tag.lstrip("#"))
+        self.window.set_task_rule_summary(
+            self.config.filename_template,
+            self.config.preserve_original_name,
+            self.config.duplicate_mode,
+            self.config.open_after_download,
+        )
+        self.window.set_summary(
+            self.config.save_root,
+            SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
+        )
+        self.window.set_settings_defaults(self._settings_dict())
+        self.window.set_session_status(False, "等待连接 Telegram")
+        self.window.set_login_phone(self.config.phone)
+
+    def _settings_dict(self) -> dict:
+        return {
+            "save_root": self.config.save_root,
+            "save_mode": self.config.save_mode,
+            "max_posts": self.config.max_posts,
+            "concurrency": self.config.concurrency,
+            "request_interval": self.config.request_interval,
+            "filename_limit": self.config.filename_limit,
+            "empty_tag_action": self.config.empty_tag_action,
+            "restore_on_launch": self.config.restore_on_launch,
+            "use_last_mode": self.config.use_last_mode,
+            "auto_fill_tag": self.config.auto_fill_tag,
+            "skip_duplicates": self.config.duplicate_mode,
+            "filename_template": self.config.filename_template,
+            "preserve_original_name": self.config.preserve_original_name,
+            "api_id": self.config.api_id,
+            "api_hash": self.config.api_hash,
+            "session_name": self.config.session_name,
+            "session_path": self.config.session_path.parent,
+            "theme_mode": self.config.theme_mode,
+            "lang": self.config.lang,
+            "open_after_download": self.config.open_after_download,
+            "enable_animations": self.config.enable_animations,
+            "enable_rounded_corners": self.config.enable_rounded_corners,
+            "use_dpapi_encryption": self.config.use_dpapi_encryption,
+        }
+
+    def _connect_ui(self) -> None:
+        w = self.window
+        w.task_start_requested.connect(self.start_task)
+        w.task_cancel_requested.connect(self.cancel_task)
+        w.task_pause_requested.connect(self.pause_task)
+        w.task_delete_requested.connect(self.delete_task)
+        w.task_preview_requested.connect(self.start_preview)
+        w.task_preview_cancel_requested.connect(self.cancel_preview)
+        w.task_pause_all_requested.connect(self.pause_all)
+        w.task_clear_queue_requested.connect(self.clear_queue)
+        w.task_page.save_template_requested.connect(self.save_template)
+        w.task_page.resume_task_requested.connect(self.resume_last_task)
+        w.home_page.resume_task_requested.connect(self.resume_last_task)
+        w.send_code_requested.connect(self.send_code)
+        w.login_requested.connect(self.sign_in)
+        w.qr_requested.connect(self.start_qr_login)
+        w.logout_requested.connect(self.logout)
+        w.settings_save_requested.connect(self.save_settings)
+        w.settings_logout_requested.connect(self.logout)
+        w.settings_cache_clear_requested.connect(self.clear_cache)
+        w.open_folder_requested.connect(self.open_folder)
+        w.history_clear_requested.connect(self.clear_history)
+        w.trend_period_changed.connect(self.refresh_trend)
+        w.window_closing.connect(self.shutdown)
+        w.task_page.open_current_folder_requested.connect(self.open_specific_folder)
+
+    def open_specific_folder(self, path_str: str) -> None:
+        path = Path(path_str).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(path.as_uri())
+
+    def clear_queue(self) -> None:
+        self.cancel_task()  # 先停止当前任务
+        self.queue.clear()
+        self.window.set_task_queue(self.queue)
+
+    def pause_all(self) -> None:
+        self.cancel_task()
+        for task in self.queue:
+            if task.status not in {"已完成", "已取消"}:
+                task.status = "已暂停"
+        self.window.set_task_queue(self.queue)
+
+    def clear_cache(self) -> None:
+        session_dir = self.config.session_path.parent
+        active_journal = Path(f"{self.config.session_path}.session-journal")
+        count = 0
+        if session_dir.exists():
+            candidates = [*session_dir.glob("*.journal"), *session_dir.glob("*.session-journal")]
+            for path in candidates:
+                if self.worker and self.worker.isRunning() and path == active_journal:
+                    continue
+                try:
+                    path.unlink()
+                    count += 1
+                except OSError:
+                    continue
+        self.window.show_success(f"已清理 {count} 个缓存文件")
+
+    def _credentials(self) -> TelegramCredentials:
+        return TelegramCredentials(
+            api_id=int(self.config.api_id),
+            api_hash=self.config.api_hash.strip(),
+            phone=self.config.phone.strip(),
+            session_path=self.config.session_path,
+        )
+
+    def _ensure_worker(self, quiet: bool = False) -> bool:
+        if self.worker and self.worker.isRunning():
+            return True
+        try:
+            credentials = self._credentials()
+            if not credentials.api_hash:
+                raise ValueError
+        except ValueError:
+            self.window.set_session_status(False, "请先在设置中填写 API ID 与 API Hash")
+            self.window.set_qr_message(
+                "暂时无法生成二维码\n请先在“设置 → 会话与安全”中填写\nAPI ID 与 API Hash",
+                allow_auto_retry=True,
+            )
+            if not quiet:
+                self.window.show_error("请先在设置中填写有效的 API ID 与 API Hash")
+            return False
+
+        self.worker = TelegramWorker(credentials, use_encryption=self.config.use_dpapi_encryption)
+        self.worker.ready.connect(self._on_worker_ready)
+        self.worker.status_changed.connect(self.window.set_task_detail)
+        self.worker.authorized.connect(self._on_authorized)
+        self.worker.user_profile_updated.connect(self._on_user_profile_updated)
+        self.worker.code_sent.connect(
+            lambda phone: self.window.show_success(f"验证码已发送至 {phone}")
+        )
+        self.worker.qr_ready.connect(self.window.show_qr)
+        self.worker.password_required.connect(self._on_password_required)
+        self.worker.auth_failed.connect(self.window.show_error)
+        self.worker.logged_out.connect(self._on_logged_out)
+        self.worker.scan_started.connect(lambda: self.window.set_task_busy(True))
+        self.worker.scan_progress.connect(self._on_scan_progress)
+        self.worker.scan_finished.connect(self._on_scan_finished)
+        self.worker.scan_failed.connect(self._on_scan_failed)
+        self.worker.preview_progress.connect(self.window.set_search_preview_progress)
+        self.worker.preview_finished.connect(self._on_preview_finished)
+        self.worker.preview_failed.connect(self._on_preview_failed)
+        self.worker.start()
+        return True
+
+    def _restart_worker(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(4000)
+        self.worker = None
+        self.authorized = False
+        self.window.set_account()
+        self._ensure_worker(quiet=True)
+
+    def _on_worker_ready(self, authorized: bool) -> None:
+        self.window.set_session_status(authorized, "本地 Telethon Session 已加载" if authorized else "未登录")
+        if not authorized:
+            self.window.set_account()
+
+    def _on_authorized(self, name: str, phone: str) -> None:
+        self.authorized = True
+        self.config.phone = phone
+        self.config.save()
+        self.window.set_account(name, phone, "Telethon")
+        self.window.set_session_status(True, "当前会话可正常使用")
+        self.window.show_success(f"欢迎回来，{name}")
+
+    def _on_user_profile_updated(self, name: str, phone: str, avatar_bytes: bytes) -> None:
+        """处理用户头像更新"""
+        self.window.login_page.set_user_avatar(avatar_bytes)
+
+    def send_code(self, phone: str) -> None:
+        if not phone:
+            self.window.show_error("请输入包含国家代码的手机号")
+            return
+        if self._ensure_worker() and self.worker:
+            self.config.phone = phone
+            self.config.save()
+            self.worker.request_code(phone)
+
+    def sign_in(self, phone: str, code: str, password: str) -> None:
+        if not phone or (not code and not password):
+            self.window.show_error("请输入手机号和验证码")
+            return
+        if self._ensure_worker() and self.worker:
+            self.worker.sign_in(phone, code, password)
+
+    def start_qr_login(self) -> None:
+        if self.authorized:
+            self.window.set_qr_message("当前账号已登录，无需扫码")
+            return
+        if self._ensure_worker(quiet=True) and self.worker:
+            self.window.set_qr_message("正在生成二维码…")
+            self.worker.start_qr_login()
+
+    def _on_password_required(self) -> None:
+        self.window.show_info("此账号已开启两步验证，请输入密码后再次登录")
+        self.window.navigate_to_login()
+
+    def logout(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self.worker.log_out()
+        else:
+            self.window.show_info("当前没有已连接的账号")
+
+    def _on_logged_out(self) -> None:
+        self.worker = None
+        self.authorized = False
+        self.window.set_account()
+        self.window.set_session_status(False, "已退出当前账号")
+        self.window.show_success("已退出当前账号")
+
+    def start_task(self, params: dict) -> None:
+        if not params.get("channel") or not params.get("save_root"):
+            self.window.show_error("请填写频道和保存位置")
+            return
+        if not self.authorized:
+            self.window.show_error("请先登录 Telegram")
+            self.window.navigate_to_login()
+            return
+        mode = params.get("save_mode") or self.config.save_mode
+        if mode == "default":
+            mode = self.config.save_mode
+        if mode not in SAVE_MODE_LABELS:
+            mode = self.config.save_mode if self.config.save_mode in SAVE_MODE_LABELS else "tag"
+        duplicate_mode = "skip" if params.get("skip_duplicates", True) else self.config.duplicate_mode
+        if duplicate_mode == "skip" and not params.get("skip_duplicates", True):
+            duplicate_mode = "rename"
+        request = ScanRequest(
+            channel=params["channel"],
+            tag=params.get("tag", ""),
+            save_root=Path(params["save_root"]).expanduser(),
+            save_mode=mode,
+            max_posts=self.config.max_posts,
+            skip_duplicates=duplicate_mode == "skip",
+            duplicate_mode=duplicate_mode,
+            preserve_original_name=self.config.preserve_original_name,
+            filename_template=self.config.filename_template,
+            extract_button_link=bool(params.get("extract_button_link")),
+            button_keyword=str(params.get("button_keyword", "")).strip() or "原图",
+            only_images=bool(params.get("only_images", True)),
+            include_replies=bool(params.get("include_replies", True)),
+            concurrency=max(1, int(self.config.concurrency)),
+            request_interval=max(0.0, float(self.config.request_interval)),
+            filename_limit=max(20, int(self.config.filename_limit)),
+            empty_tag_action=self.config.empty_tag_action,
+        )
+        self.config.channel = request.channel
+        self.config.tag = request.tag
+        # 保存任务状态以便恢复
+        self.config.last_task_state = {
+            "channel": request.channel,
+            "tag": request.tag,
+            "params": params,
+        }
+        self.config.save()
+        self.current_request = request
+        self.current_open_after = bool(params.get("open_after"))
+        self.cancelled = False
+        self.queue.insert(
+            0,
+            TaskRow(request.channel, request.tag or "全部", "下载中", 0, 0, 0),
+        )
+        self.window.set_task_queue(self.queue)
+        assert self.worker is not None
+        self.worker.start_scan(request)
+
+    def save_template(self, params: dict) -> None:
+        """保存当前任务配置为模板（实际就是更新默认设置）"""
+        if params.get("save_root"):
+            self.config.save_root = params["save_root"]
+        if params.get("save_mode") and params["save_mode"] != "default":
+            self.config.save_mode = params["save_mode"]
+        self.config.save()
+        self.window.show_success("已保存为默认模板")
+        self.window.set_task_defaults(
+            self.config.save_root,
+            SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
+            self.config.save_mode,
+        )
+
+    def resume_last_task(self) -> None:
+        """继续上次任务"""
+        if not self.config.last_task_state:
+            self.window.show_info("暂无可恢复的任务")
+            return
+        state = self.config.last_task_state
+        self.window.navigate_to_task()
+        self.window.task_page.restore_last_params(
+            state.get("channel", ""),
+            state.get("tag", "")
+        )
+
+    def start_preview(self, params: dict) -> None:
+        channel = str(params.get("channel", "")).strip()
+        tag = str(params.get("tag", "")).strip()
+        if not channel:
+            self.window.show_error("请先填写要搜索的频道、用户名或 ID")
+            return
+        if not self.authorized:
+            self.window.show_error("请先登录 Telegram，再搜索预览")
+            self.window.navigate_to_login()
+            return
+        if not self._ensure_worker() or not self.worker:
+            return
+        self.window.show_search_preview_loading(channel, tag)
+        self.worker.start_preview(
+            PreviewRequest(
+                channel=channel,
+                tag=tag,
+                max_posts=self.config.max_posts,
+            )
+        )
+
+    def cancel_preview(self) -> None:
+        if self.worker:
+            self.worker.cancel_preview()
+        self.window.task_page.set_preview_busy(False)
+
+    def _on_preview_finished(self, rows: list[dict]) -> None:
+        self.window.set_search_preview_results(rows)
+
+    def _on_preview_failed(self, message: str) -> None:
+        self.window.set_search_preview_error(message)
+
+    def cancel_task(self) -> None:
+        if self.worker:
+            self.cancelled = True
+            self.worker.cancel_scan()
+            self.window.set_task_detail("正在停止任务…")
+
+    def pause_task(self, index: int) -> None:
+        if 0 <= index < len(self.queue):
+            self.queue[index].status = "已暂停"
+            self.window.set_task_queue(self.queue)
+        if index == 0:
+            self.cancel_task()
+
+    def delete_task(self, index: int) -> None:
+        if 0 <= index < len(self.queue):
+            self.queue.pop(index)
+            self.window.set_task_queue(self.queue)
+
+    def _on_scan_progress(self, downloaded: int, skipped: int, location: str) -> None:
+        self.window.set_task_detail(f"{location} · 已下载 {downloaded} 张 · 已跳过 {skipped} 张")
+        if self.queue:
+            self.queue[0].downloaded = downloaded
+            self.queue[0].total = downloaded + skipped
+            self.window.set_task_queue(self.queue)
+
+    def _on_scan_finished(self, posts: int, downloaded: int, skipped: int) -> None:
+        self.window.set_task_busy(False)
+        status = "已取消" if self.cancelled else "已完成"
+        if self.queue:
+            self.queue[0].status = status
+            self.queue[0].progress = 0 if self.cancelled else 100
+            self.queue[0].downloaded = downloaded
+            self.queue[0].total = downloaded + skipped
+            self.window.set_task_queue(self.queue)
+        self.window.set_task_detail(
+            f"{status}：匹配 {posts} 篇帖子，下载 {downloaded} 张，跳过 {skipped} 张"
+        )
+        if self.current_request:
+            self.config.add_history(
+                {
+                    "channel": self.current_request.channel,
+                    "tag": self.current_request.tag,
+                    "status": status,
+                    "posts": posts,
+                    "downloaded": downloaded,
+                    "skipped": skipped,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+            )
+        self._refresh_local_data()
+        if self.current_open_after and self.current_request:
+            self.open_specific_folder(str(self.current_request.save_root))
+        self.window.show_success(f"任务结束，新增 {downloaded} 张图片")
+
+    def _on_scan_failed(self, message: str) -> None:
+        self.window.set_task_busy(False)
+        if self.queue:
+            self.queue[0].status = "已取消"
+            self.window.set_task_queue(self.queue)
+        self.window.show_error(f"任务失败：{message}")
+
+    def save_settings(self, values: dict) -> None:
+        old_credentials = (self.config.api_id, self.config.api_hash, self.config.session_name, self.config.session_dir)
+        mode = values.get("save_mode", self.config.save_mode)
+        if mode == "last":
+            mode = self.config.save_mode
+        self.config.save_root = values.get("save_root") or self.config.save_root
+        self.config.save_mode = mode
+        self.config.max_posts = int(values.get("max_posts", self.config.max_posts))
+        self.config.concurrency = max(1, int(values.get("concurrency", self.config.concurrency)))
+        self.config.request_interval = max(
+            0.0, float(values.get("request_interval", self.config.request_interval))
+        )
+        self.config.filename_limit = max(
+            20, int(values.get("filename_limit", self.config.filename_limit))
+        )
+        self.config.empty_tag_action = values.get("empty_tag_action", self.config.empty_tag_action)
+        self.config.restore_on_launch = bool(
+            values.get("restore_on_launch", self.config.restore_on_launch)
+        )
+        self.config.use_last_mode = bool(values.get("use_last_mode", self.config.use_last_mode))
+        self.config.auto_fill_tag = bool(values.get("auto_fill_tag", self.config.auto_fill_tag))
+        self.config.duplicate_mode = values.get("skip_duplicates", self.config.duplicate_mode)
+        self.config.skip_duplicates = self.config.duplicate_mode == "skip"
+        self.config.filename_template = values.get("filename_template") or self.config.filename_template
+        self.config.preserve_original_name = bool(values.get("preserve_original_name", True))
+        self.config.api_id = values.get("api_id", "").strip()
+        self.config.api_hash = values.get("api_hash", "").strip()
+        self.config.session_name = values.get("session_name", "default").strip() or "default"
+        self.config.session_dir = values.get("session_path", "").strip()
+        self.config.theme_mode = values.get("theme_mode", "auto")
+        self.config.lang = values.get("lang") or self.config.lang
+        self.config.open_after_download = bool(values.get("open_after_download"))
+        self.config.enable_animations = bool(values.get("enable_animations", True))
+        self.config.enable_rounded_corners = bool(values.get("enable_rounded_corners", True))
+        self.config.use_dpapi_encryption = bool(values.get("use_dpapi_encryption", True))
+        self.config.save()
+        self._apply_theme()
+        self.window.set_task_defaults(
+            self.config.save_root,
+            SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
+            self.config.save_mode,
+        )
+        self.window.set_task_rule_summary(
+            self.config.filename_template,
+            self.config.preserve_original_name,
+            self.config.duplicate_mode,
+            self.config.open_after_download,
+        )
+        self.window.set_summary(
+            self.config.save_root,
+            SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
+        )
+        self.window.show_success("设置已保存")
+        new_credentials = (self.config.api_id, self.config.api_hash, self.config.session_name, self.config.session_dir)
+        if old_credentials != new_credentials:
+            self._restart_worker()
+
+    def _apply_theme(self) -> None:
+        theme = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}.get(
+            self.config.theme_mode, Theme.AUTO
+        )
+        setTheme(theme)
+
+    def clear_history(self) -> None:
+        self.config.history = []
+        self.config.save()
+        self._refresh_local_data()
+        self.window.show_success("下载历史已清空")
+
+    def open_folder(self) -> None:
+        path = Path(self.config.save_root).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(path.as_uri())
+
+    def _refresh_local_data(self) -> None:
+        history = self.config.history or []
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        today = sum(int(item.get("downloaded", 0)) for item in history if str(item.get("time", "")).startswith(today_key))
+        total = sum(int(item.get("downloaded", 0)) for item in history)
+        tags = {item.get("tag") for item in history if item.get("tag")}
+        common_tags = []
+        for item in history:
+            tag = str(item.get("tag", "")).strip()
+            if tag and tag not in common_tags:
+                common_tags.append(tag)
+        self.window.set_home_stats(
+            today,
+            total,
+            len(history),
+            len(tags),
+            self._disk_usage(),
+            history[0].get("time", "-")[5:16] if history else "-",
+        )
+        self.window.set_common_tags(common_tags)
+        self.refresh_trend("day")
+        self.window.set_home_recent_tasks(
+            [
+                {
+                    "name": item.get("channel", "-"),
+                    "status": item.get("status", "已完成"),
+                    "progress": 100 if item.get("status") == "已完成" else 0,
+                    "time": item.get("time", "-")[5:16],
+                }
+                for item in history[:5]
+            ]
+        )
+        self.window.set_history(
+            [
+                HistoryRow(
+                    item.get("channel", "-"),
+                    item.get("tag", ""),
+                    item.get("status", "已完成"),
+                    int(item.get("posts", 0)),
+                    int(item.get("downloaded", 0)),
+                    item.get("time", "-"),
+                )
+                for item in history
+            ]
+        )
+
+    def refresh_trend(self, period: str) -> None:
+        history = self.config.history or []
+        trend = []
+        labels = []
+        if period == "week":
+            today = datetime.now()
+            current_monday = today - timedelta(days=today.weekday())
+            for offset in range(6, -1, -1):
+                start = current_monday - timedelta(weeks=offset)
+                end = start + timedelta(days=7)
+                labels.append(start.strftime("%m-%d"))
+                trend.append(
+                    sum(
+                        int(item.get("downloaded", 0))
+                        for item in history
+                        if start
+                        <= self._record_datetime(item.get("time"))
+                        < end
+                    )
+                )
+        else:
+            for offset in range(6, -1, -1):
+                day = datetime.now() - timedelta(days=offset)
+                key = day.strftime("%Y-%m-%d")
+                labels.append(day.strftime("%m-%d"))
+                trend.append(
+                    sum(
+                        int(item.get("downloaded", 0))
+                        for item in history
+                        if str(item.get("time", "")).startswith(key)
+                    )
+                )
+        self.window.set_home_trend_with_labels(trend, labels)
+
+    @staticmethod
+    def _record_datetime(value) -> datetime:
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M")
+        except ValueError:
+            return datetime.min
+
+    def _disk_usage(self) -> str:
+        root = Path(self.config.save_root).expanduser()
+        if not root.exists():
+            return "0 B"
+        try:
+            total = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+        except OSError:
+            return "-"
+        for unit in ("B", "KB", "MB", "GB"):
+            if total < 1024 or unit == "GB":
+                return f"{total:.1f} {unit}" if unit != "B" else f"{int(total)} B"
+            total /= 1024
+        return "0 B"
+
+    def shutdown(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(4000)
