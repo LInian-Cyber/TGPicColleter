@@ -452,7 +452,9 @@ class AppController(QObject):
         )
         task.progress = int(completed * 100 / max(1, len(task.post_statuses)))
         self.window.set_task_queue(self.queue)
-        self._refresh_log_view()
+        # 只在帖子真正完成时刷新日志，不在每次状态变化时刷新
+        if status.startswith("已完成"):
+            self._refresh_log_view()
 
     def _on_scan_finished(self, posts: int, downloaded: int, skipped: int) -> None:
         self.window.set_task_busy(False)

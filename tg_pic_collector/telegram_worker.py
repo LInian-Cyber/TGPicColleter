@@ -426,7 +426,8 @@ class TelegramWorker(QThread):
                     record_file(post_id, target, False, f"下载失败: {exc}")
 
         async def finish_post(post_id: int) -> None:
-            await collect_finished(wait_all=True)
+            # 不再等所有任务，只收割已完成的，保持并发继续跑
+            await collect_finished(wait_all=False)
             downloaded_count = post_downloads.get(post_id, 0)
             skipped_count = post_skips.get(post_id, 0)
             if self.cancel_event.is_set():
