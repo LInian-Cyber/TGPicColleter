@@ -79,6 +79,8 @@ class TelegramWorker(QThread):
     preview_finished = Signal(list)
     preview_failed = Signal(str)
     user_profile_updated = Signal(str, str, bytes)  # name, phone, avatar_bytes
+    channel_info_fetched = Signal(str, str, bytes)  # channel_id, channel_name, avatar_bytes
+    dialogs_loaded = Signal(list)  # 对话列表加载完成
 
     def __init__(self, credentials: TelegramCredentials, parent=None, use_encryption: bool = True) -> None:
         super().__init__(parent)
@@ -92,6 +94,10 @@ class TelegramWorker(QThread):
         self._phone = credentials.phone
         # 搜索预览缓存：{(channel, tag): results}
         self._preview_cache: dict[tuple[str, str], list[dict]] = {}
+
+    def load_dialogs(self) -> None:
+        """加载用户的对话列表（频道、群组等）"""
+        self.commands.put(("load_dialogs", None))
 
     def request_code(self, phone: str) -> None:
         self.qr_cancel_event.set()
@@ -184,6 +190,11 @@ class TelegramWorker(QThread):
                         await self._preview(client, payload)
                     else:
                         self.preview_failed.emit("请先登录 Telegram")
+                elif command == "load_dialogs":
+                    if await client.is_user_authorized():
+                        await self._load_dialogs(client)
+                    else:
+                        self.dialogs_loaded.emit([])
         finally:
             await client.disconnect()
             # 断开后加密 session
@@ -275,6 +286,63 @@ class TelegramWorker(QThread):
                 b""
             )
 
+    async def _load_dialogs(self, client: TelegramClient) -> None:
+        """加载用户的对话列表（频道、群组等）"""
+        try:
+            dialogs = []
+            async for dialog in client.iter_dialogs(limit=100):
+                entity = dialog.entity
+                
+                # 只选择频道和超级群组
+                if hasattr(entity, 'broadcast') and entity.broadcast:  # 频道
+                    entity_type = "channel"
+                elif hasattr(entity, 'megagroup') and entity.megagroup:  # 超级群组
+                    entity_type = "supergroup"
+                elif hasattr(entity, 'username') and entity.username:  # 有用户名的群组/频道
+                    entity_type = "public"
+                else:
+                    continue  # 跳过普通用户和私聊群组
+                
+                # 获取名称和ID
+                name = getattr(entity, 'title', '') or getattr(entity, 'username', '')
+                username = getattr(entity, 'username', '')
+                entity_id = getattr(entity, 'id', '')
+                
+                if not name:
+                    continue
+                
+                # 构建显示ID
+                if username:
+                    display_id = f"@{username}"
+                else:
+                    display_id = f"-100{entity_id}" if entity_id else ""
+                
+                if not display_id:
+                    continue
+                
+                # 获取头像
+                avatar_bytes = b""
+                try:
+                    avatar_data = await client.download_profile_photo(entity, file=bytes)
+                    if isinstance(avatar_data, bytes):
+                        avatar_bytes = avatar_data
+                except Exception:
+                    pass
+                
+                dialogs.append({
+                    "name": name,
+                    "id": display_id,
+                    "avatar": avatar_bytes,
+                    "type": entity_type
+                })
+            
+            # 按名称排序
+            dialogs.sort(key=lambda x: x["name"].lower())
+            self.dialogs_loaded.emit(dialogs)
+            
+        except Exception as exc:
+            self.dialogs_loaded.emit([])
+
     async def _scan(self, client: TelegramClient, request: ScanRequest) -> None:
         self.scan_started.emit()
         matched_posts = 0
@@ -311,102 +379,229 @@ class TelegramWorker(QThread):
                 or getattr(entity, "username", None)
                 or "channel"
             )
+            
+            # 获取频道头像
+            channel_id = getattr(entity, "username", None) or str(getattr(entity, "id", channel_ref))
+            if not channel_id.startswith("@") and not channel_id.startswith("-"):
+                channel_id = f"@{channel_id}" if hasattr(entity, "username") else f"-{channel_id}"
+            
+            try:
+                avatar_bytes = await client.download_profile_photo(entity, file=bytes)
+                if isinstance(avatar_bytes, bytes):
+                    self.channel_info_fetched.emit(channel_id, channel_name, avatar_bytes)
+                else:
+                    self.channel_info_fetched.emit(channel_id, channel_name, b"")
+            except Exception:
+                self.channel_info_fetched.emit(channel_id, channel_name, b"")
+            
             tag = request.tag.strip()
-            self.status_changed.emit(f"正在频道中搜索 {tag or '全部帖子'}")
+            
+            # 检查是否有预览缓存
+            cache_key = (request.channel.strip(), request.tag.strip())
+            cached_posts = None
+            if cache_key in self._preview_cache:
+                self.status_changed.emit(f"使用搜索预览缓存，开始下载")
+                cached_posts = self._preview_cache[cache_key]
+                matched_posts = len(cached_posts)
+            else:
+                self.status_changed.emit(f"正在频道中搜索 {tag or '全部帖子'}")
 
-            async for post in client.iter_messages(
-                    entity, search=tag or None, limit=request.max_posts
-            ):
-                if self.cancel_event.is_set():
-                    break
-                if tag and tag.casefold() not in (post.message or "").casefold():
-                    continue
-                if not tag and request.empty_tag_action == "skip":
-                    continue
-
-                matched_posts += 1
-                self.status_changed.emit(f"正在检查帖子 #{post.id} 的评论")
-                if request.extract_button_link:
-                    button_link = self._find_button_url(post, request.button_keyword)
-                    if button_link:
-                        button_text, original_url = button_link
-                        target_dir = self._target_dir(request, channel_name, post.id)
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        target = target_dir / (
-                            f"post_{post.id}_{safe_name(button_text, '原图链接')}.url"
-                        )
-                        if target.exists():
-                            if request.skip_duplicates or request.duplicate_mode == "skip":
-                                skipped += 1
-                                self.scan_progress.emit(
-                                    downloaded, skipped, f"帖子 #{post.id} · 原图链接"
+            # 如果有缓存，使用缓存的帖子ID列表
+            if cached_posts:
+                for cached_post in cached_posts:
+                    if self.cancel_event.is_set():
+                        break
+                    
+                    post_id = cached_post.get("post_id")
+                    if not post_id:
+                        continue
+                    
+                    try:
+                        # 获取完整的帖子对象以下载媒体
+                        post = await client.get_messages(entity, ids=post_id)
+                        if not post:
+                            continue
+                        
+                        self.status_changed.emit(f"正在下载帖子 #{post.id} 的评论区图片")
+                        
+                        # 提取按钮链接
+                        if request.extract_button_link:
+                            button_link = self._find_button_url(post, request.button_keyword)
+                            if button_link:
+                                button_text, original_url = button_link
+                                target_dir = self._target_dir(request, channel_name, post.id)
+                                target_dir.mkdir(parents=True, exist_ok=True)
+                                target = target_dir / (
+                                    f"post_{post.id}_{safe_name(button_text, '原图链接')}.url"
                                 )
+                                if target.exists():
+                                    if request.skip_duplicates or request.duplicate_mode == "skip":
+                                        skipped += 1
+                                        self.scan_progress.emit(
+                                            downloaded, skipped, f"帖子 #{post.id} · 原图链接"
+                                        )
+                                    else:
+                                        if request.duplicate_mode == "rename":
+                                            target = self._available_target(target)
+                                        self._write_url_shortcut(target, original_url)
+                                        downloaded += 1
+                                        self.scan_progress.emit(
+                                            downloaded, skipped, f"帖子 #{post.id} · 原图链接"
+                                        )
+                                else:
+                                    self._write_url_shortcut(target, original_url)
+                                    downloaded += 1
+                                    self.scan_progress.emit(
+                                        downloaded, skipped, f"帖子 #{post.id} · 原图链接"
+                                    )
+
+                        if not request.include_replies:
+                            continue
+
+                        try:
+                            comment_iter = client.iter_messages(entity, reply_to=post.id)
+                            async for comment in comment_iter:
+                                if self.cancel_event.is_set():
+                                    break
+                                if request.only_images and not is_image_message(comment):
+                                    continue
+                                if not request.only_images and not is_downloadable_message(comment):
+                                    continue
+
+                                target_dir = self._target_dir(request, channel_name, post.id)
+                                target_dir.mkdir(parents=True, exist_ok=True)
+                                raw_filename = self._file_name(
+                                    comment,
+                                    post.id,
+                                    request.filename_template,
+                                    request.preserve_original_name,
+                                )
+                                suffix = Path(raw_filename).suffix
+                                stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
+                                stem = Path(raw_filename).stem[:stem_limit]
+                                target = target_dir / f"{stem}{suffix}"
+                                if target.exists() or target in reserved_targets:
+                                    if request.skip_duplicates or request.duplicate_mode == "skip":
+                                        skipped += 1
+                                        self.scan_progress.emit(downloaded, skipped, f"帖子 #{post.id}")
+                                        continue
+                                    if request.duplicate_mode == "rename":
+                                        target = self._available_target(target, reserved_targets)
+                                elif target in reserved_targets:
+                                    await collect_finished(wait_all=True)
+                                reserved_targets.add(target)
+                                pending.add(
+                                    asyncio.create_task(
+                                        self._download_media(
+                                            client,
+                                            comment,
+                                            target,
+                                            semaphore,
+                                            request.request_interval,
+                                        )
+                                    )
+                                )
+                                if len(pending) >= max(1, request.concurrency):
+                                    await collect_finished()
+                        except errors.RPCError:
+                            pass
+                    except Exception:
+                        continue
+            else:
+                # 没有缓存，正常扫描
+                async for post in client.iter_messages(
+                        entity, search=tag or None, limit=request.max_posts
+                ):
+                    if self.cancel_event.is_set():
+                        break
+                    if tag and tag.casefold() not in (post.message or "").casefold():
+                        continue
+                    if not tag and request.empty_tag_action == "skip":
+                        continue
+
+                    matched_posts += 1
+                    self.status_changed.emit(f"正在检查帖子 #{post.id} 的评论")
+                    if request.extract_button_link:
+                        button_link = self._find_button_url(post, request.button_keyword)
+                        if button_link:
+                            button_text, original_url = button_link
+                            target_dir = self._target_dir(request, channel_name, post.id)
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            target = target_dir / (
+                                f"post_{post.id}_{safe_name(button_text, '原图链接')}.url"
+                            )
+                            if target.exists():
+                                if request.skip_duplicates or request.duplicate_mode == "skip":
+                                    skipped += 1
+                                    self.scan_progress.emit(
+                                        downloaded, skipped, f"帖子 #{post.id} · 原图链接"
+                                    )
+                                else:
+                                    if request.duplicate_mode == "rename":
+                                        target = self._available_target(target)
+                                    self._write_url_shortcut(target, original_url)
+                                    downloaded += 1
+                                    self.scan_progress.emit(
+                                        downloaded, skipped, f"帖子 #{post.id} · 原图链接"
+                                    )
                             else:
-                                if request.duplicate_mode == "rename":
-                                    target = self._available_target(target)
                                 self._write_url_shortcut(target, original_url)
                                 downloaded += 1
                                 self.scan_progress.emit(
                                     downloaded, skipped, f"帖子 #{post.id} · 原图链接"
                                 )
-                        else:
-                            self._write_url_shortcut(target, original_url)
-                            downloaded += 1
-                            self.scan_progress.emit(
-                                downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                            )
 
-                if not request.include_replies:
-                    continue
+                    if not request.include_replies:
+                        continue
 
-                try:
-                    comment_iter = client.iter_messages(entity, reply_to=post.id)
-                    async for comment in comment_iter:
-                        if self.cancel_event.is_set():
-                            break
-                        if request.only_images and not is_image_message(comment):
-                            continue
-                        if not request.only_images and not is_downloadable_message(comment):
-                            continue
-
-                        target_dir = self._target_dir(request, channel_name, post.id)
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        raw_filename = self._file_name(
-                            comment,
-                            post.id,
-                            request.filename_template,
-                            request.preserve_original_name,
-                        )
-                        suffix = Path(raw_filename).suffix
-                        stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
-                        stem = Path(raw_filename).stem[:stem_limit]
-                        target = target_dir / f"{stem}{suffix}"
-                        if target.exists() or target in reserved_targets:
-                            if request.skip_duplicates or request.duplicate_mode == "skip":
-                                skipped += 1
-                                self.scan_progress.emit(downloaded, skipped, f"帖子 #{post.id}")
+                    try:
+                        comment_iter = client.iter_messages(entity, reply_to=post.id)
+                        async for comment in comment_iter:
+                            if self.cancel_event.is_set():
+                                break
+                            if request.only_images and not is_image_message(comment):
                                 continue
-                            if request.duplicate_mode == "rename":
-                                target = self._available_target(target, reserved_targets)
-                        elif target in reserved_targets:
-                            await collect_finished(wait_all=True)
-                        reserved_targets.add(target)
-                        pending.add(
-                            asyncio.create_task(
-                                self._download_media(
-                                    client,
-                                    comment,
-                                    target,
-                                    semaphore,
-                                    request.request_interval,
+                            if not request.only_images and not is_downloadable_message(comment):
+                                continue
+
+                            target_dir = self._target_dir(request, channel_name, post.id)
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            raw_filename = self._file_name(
+                                comment,
+                                post.id,
+                                request.filename_template,
+                                request.preserve_original_name,
+                            )
+                            suffix = Path(raw_filename).suffix
+                            stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
+                            stem = Path(raw_filename).stem[:stem_limit]
+                            target = target_dir / f"{stem}{suffix}"
+                            if target.exists() or target in reserved_targets:
+                                if request.skip_duplicates or request.duplicate_mode == "skip":
+                                    skipped += 1
+                                    self.scan_progress.emit(downloaded, skipped, f"帖子 #{post.id}")
+                                    continue
+                                if request.duplicate_mode == "rename":
+                                    target = self._available_target(target, reserved_targets)
+                            elif target in reserved_targets:
+                                await collect_finished(wait_all=True)
+                            reserved_targets.add(target)
+                            pending.add(
+                                asyncio.create_task(
+                                    self._download_media(
+                                        client,
+                                        comment,
+                                        target,
+                                        semaphore,
+                                        request.request_interval,
+                                    )
                                 )
                             )
-                        )
-                        if len(pending) >= max(1, request.concurrency):
-                            await collect_finished()
-                except errors.RPCError:
-                    # 该帖子没有评论区或评论区不可访问，跳过继续处理下一条帖子
-                    pass
+                            if len(pending) >= max(1, request.concurrency):
+                                await collect_finished()
+                    except errors.RPCError:
+                        # 该帖子没有评论区或评论区不可访问，跳过继续处理下一条帖子
+                        pass
 
             await collect_finished(wait_all=True)
 

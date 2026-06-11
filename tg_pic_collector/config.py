@@ -39,6 +39,7 @@ class AppConfig:
     enable_rounded_corners: bool = True
     use_dpapi_encryption: bool = True
     last_task_state: dict | None = None
+    channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "avatar_path": "path/to/avatar.jpg"}, ...]
 
     @property
     def config_dir(self) -> Path:
@@ -64,6 +65,80 @@ class AppConfig:
         history.insert(0, record)
         self.history = history[:100]
         self.save()
+
+    def add_channel_to_history(self, channel_id: str, channel_name: str = "", avatar_bytes: bytes = b"") -> None:
+        """添加频道到历史记录"""
+        history = list(self.channel_history or [])
+        
+        # 检查是否已存在
+        for item in history:
+            if item.get("id") == channel_id:
+                # 更新已存在的记录
+                item["name"] = channel_name or item.get("name", "")
+                if avatar_bytes:
+                    avatar_path = self._save_channel_avatar(channel_id, avatar_bytes)
+                    if avatar_path:
+                        item["avatar_path"] = avatar_path
+                self.channel_history = history
+                self.save()
+                return
+        
+        # 保存头像到本地
+        avatar_path = ""
+        if avatar_bytes:
+            avatar_path = self._save_channel_avatar(channel_id, avatar_bytes)
+        
+        # 添加新记录
+        history.insert(0, {
+            "id": channel_id,
+            "name": channel_name,
+            "avatar_path": avatar_path,
+        })
+        self.channel_history = history[:20]  # 最多保存20个频道
+        self.save()
+    
+    def _save_channel_avatar(self, channel_id: str, avatar_bytes: bytes) -> str:
+        """保存频道头像到本地，返回相对路径"""
+        if not avatar_bytes:
+            return ""
+        
+        # 创建头像缓存目录
+        avatar_dir = self.config_dir / "channel_avatars"
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 使用频道ID作为文件名（安全化）
+        safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f@-]', "_", channel_id).strip(" .")
+        avatar_path = avatar_dir / f"{safe_id}.jpg"
+        
+        try:
+            avatar_path.write_bytes(avatar_bytes)
+            return str(avatar_path)
+        except OSError:
+            return ""
+    
+    def get_channel_history_with_avatars(self) -> list[dict]:
+        """获取频道历史记录，包含头像字节数据"""
+        history = list(self.channel_history or [])
+        result = []
+        
+        for item in history:
+            avatar_bytes = b""
+            avatar_path = item.get("avatar_path", "")
+            if avatar_path:
+                try:
+                    path = Path(avatar_path)
+                    if path.exists():
+                        avatar_bytes = path.read_bytes()
+                except OSError:
+                    pass
+            
+            result.append({
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "avatar": avatar_bytes,
+            })
+        
+        return result
 
     @classmethod
     def load(cls) -> "AppConfig":

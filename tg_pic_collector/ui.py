@@ -43,7 +43,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QSizePolicy,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -63,6 +62,7 @@ from qfluentwidgets import (
     FluentIcon as FIF,
     FluentWindow,
     IconWidget,
+    EditableComboBox,
     InfoBar,
     InfoBarPosition,
     LineEdit,
@@ -89,6 +89,8 @@ from qfluentwidgets import (
     InfoBadge,
     MessageBoxBase,
     PillPushButton,
+    RoundMenu,
+    Action,
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -679,7 +681,15 @@ class HomePage(ScrollPage):
         self._recent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._recent_table.setShowGrid(False)
         self._recent_table.setAlternatingRowColors(True)
-        self._recent_table.setStyleSheet("QTableWidget{border:none;}")
+        self._recent_table.setStyleSheet("""
+            QTableWidget {
+                border: none;
+                background: transparent;
+            }
+            QTableWidget::item:hover {
+                background: rgba(0, 0, 0, 0.05);
+            }
+        """)
         recent_card.body.addWidget(self._recent_table)
         mid.addWidget(recent_card, 5)
 
@@ -801,19 +811,31 @@ class HomePage(ScrollPage):
             color = status_colors.get(status, C_MUTED)
             status_item.setForeground(QColor(color))
             self._recent_table.setItem(r, 1, status_item)
-            # 进度（进度条 widget）
+            # 进度（进度条 + 百分比，横向排列）
             prog = rec.get("progress", 100)
             prog_widget = QWidget()
+            prog_widget.setStyleSheet("background: transparent;")  # 透明背景，继承表格悬停效果
             prog_layout = QHBoxLayout(prog_widget)
-            prog_layout.setContentsMargins(4, 8, 4, 8)
+            prog_layout.setContentsMargins(8, 8, 8, 8)
+            prog_layout.setSpacing(8)
+            
+            # 进度条
             bar = InlineProgress(prog)
+            bar.setMinimumWidth(80)
+            bar.setMaximumWidth(120)
+            
+            # 百分比标签，放在进度条右侧
             pct_label = QLabel(f"{prog}%")
-            pct_label.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
-            pct_label.setFixedWidth(36)
+            pct_label.setStyleSheet(f"color:{C_MUTED};font-size:11px;background:transparent;")
+            pct_label.setFixedWidth(30)
+            pct_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            
             prog_layout.addWidget(bar)
             prog_layout.addWidget(pct_label)
+            prog_layout.addStretch()  # 推到左侧
+            
             self._recent_table.setCellWidget(r, 2, prog_widget)
-            self._recent_table.setRowHeight(r, 36)
+            self._recent_table.setRowHeight(r, 40)
             # 时间
             self._recent_table.setItem(r, 3, QTableWidgetItem(rec.get("time", "-")))
 
@@ -844,6 +866,7 @@ class TaskPage(ScrollPage):
         self._default_save_root = ""
         self._default_mode_label = ""
         self._default_mode_key = ""
+        self._channel_list = []  # 存储频道列表
         self._page_header("新建下载任务",
                           "默认行为来自 设置，您可在本页按需临时覆盖，上次使用的模式可一键复用。")
 
@@ -913,9 +936,11 @@ class TaskPage(ScrollPage):
 
         # 1. 频道
         form.addWidget(StrongBodyLabel("1. 频道 / 用户名 / ID"), 0, 0)
-        self.channel_edit = LineEdit()
-        self.channel_edit.setPlaceholderText("例如：@wallpapers、-1001234567890")
-        form.addWidget(self.channel_edit, 0, 1)
+        self.channel_combo = EditableComboBox()
+        self.channel_combo.setPlaceholderText("例如：@wallpapers，直接输入或从下拉历史选择")
+        self.channel_combo.setMinimumHeight(36)
+        # 移除 channel_row 包装，直接放入表单网格
+        form.addWidget(self.channel_combo, 0, 1)
 
         # 2. Tag
         form.addWidget(StrongBodyLabel("2. Tag 关键词（可选）"), 1, 0)
@@ -1111,14 +1136,88 @@ class TaskPage(ScrollPage):
         self.root.addWidget(queue_card)
         self.root.addStretch()
 
+    def _get_channel_input(self) -> str:
+        """辅助方法：智能获取频道ID"""
+        text = self.channel_combo.text().strip()
+        # 如果用户是从下拉框选的，提取出 userData (真实的 @username 或 ID)
+        idx = self.channel_combo.findText(text)
+        if idx >= 0:
+            return self.channel_combo.itemData(idx) or text
+        # 如果是用户纯手打的，直接返回手打文字
+        return text
     def _choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择图片保存位置", self.path_edit.text())
         if d:
             self.path_edit.setText(d)
 
+    def _show_channel_menu(self):
+        """显示频道选择菜单"""
+        if not self._channel_list:
+            InfoBar.info(
+                title="提示",
+                content="请先登录以加载频道列表",
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP,
+                duration=3000,
+                parent=self
+            )
+            return
+        
+        # 创建菜单
+        menu = RoundMenu(parent=self)
+        
+        for ch in self._channel_list[:20]:  # 最多显示20个频道
+            name = ch.get("name", "")
+            ch_id = ch.get("id", "")
+            avatar_bytes = ch.get("avatar", b"")
+            
+            display_text = f"{name} ({ch_id})" if name and ch_id else (ch_id or name)
+            
+            # 创建菜单项
+            if avatar_bytes:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(avatar_bytes):
+                    # 缩放为16x16的圆形头像（菜单项较小）
+                    scaled = pixmap.scaled(
+                        16, 16,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    rounded = QPixmap(16, 16)
+                    rounded.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(rounded)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    path = QPainterPath()
+                    path.addEllipse(0, 0, 16, 16)
+                    painter.setClipPath(path)
+                    painter.drawPixmap(0, 0, scaled)
+                    painter.end()
+                    
+                    icon = QIcon(rounded)
+                    action = Action(icon, display_text)
+                else:
+                    action = Action(FIF.PEOPLE, display_text)
+            else:
+                action = Action(FIF.PEOPLE, display_text)
+            
+            # 连接点击事件
+            action.triggered.connect(
+                lambda checked=False, text=ch_id: self.channel_edit.setText(text)
+            )
+            menu.addAction(action)
+        
+        if not menu.actions():
+            action = Action(FIF.INFO, "暂无可用频道")
+            action.setEnabled(False)
+            menu.addAction(action)
+        
+        # 显示菜单
+        menu.exec(self._channel_list_btn.mapToGlobal(self._channel_list_btn.rect().bottomLeft()))
+
     def _on_start(self):
         params = {
-            "channel": self.channel_edit.text().strip(),
+            "channel": self._get_channel_input(),  # ✨ 改用辅助方法提取
             "tag": self.tag_edit.text().strip(),
             "save_root": self.path_edit.text().strip(),
             "save_mode": self.mode_combo.currentData(),
@@ -1134,7 +1233,7 @@ class TaskPage(ScrollPage):
     def _on_preview(self):
         self.preview_requested.emit(
             {
-                "channel": self.channel_edit.text().strip(),
+                "channel": self._get_channel_input(),  # ✨ 改用辅助方法提取
                 "tag": self.tag_edit.text().strip(),
             }
         )
@@ -1198,8 +1297,51 @@ class TaskPage(ScrollPage):
 
     def restore_last_params(self, channel: str, tag: str):
         """恢复上次的任务参数"""
-        self.channel_edit.setText(channel)
+        self.channel_combo.setText(channel)  # ✨ 换成 combo 的 setText
         self.tag_edit.setText(tag)
+
+    def add_channel_history(self, channels: list[dict]):
+        """添加频道列表到可编辑下拉框"""
+        self._channel_list = channels
+        self.channel_combo.clear()
+
+        if not channels:
+            return
+
+        for ch in channels[:20]:  # 最多显示20个频道
+            name = ch.get("name", "")
+            ch_id = ch.get("id", "")
+            avatar_bytes = ch.get("avatar", b"")
+
+            # 显示文本，例如: 精彩壁纸 (@wallpapers)
+            display_text = f"{name} ({ch_id})" if name and ch_id else (ch_id or name)
+
+            if avatar_bytes:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(avatar_bytes):
+                    # 缩放为16x16的圆形头像
+                    scaled = pixmap.scaled(
+                        16, 16,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    rounded = QPixmap(16, 16)
+                    rounded.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(rounded)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    path = QPainterPath()
+                    path.addEllipse(0, 0, 16, 16)
+                    painter.setClipPath(path)
+                    painter.drawPixmap(0, 0, scaled)
+                    painter.end()
+
+                    icon = QIcon(rounded)
+                    # ✨ 核心修复：将第一个参数改为文字 display_text，并通过关键字显式传递 icon
+                    self.channel_combo.addItem(display_text, icon=icon, userData=ch_id)
+                    continue
+
+            # ✨ 同样确保第一个参数是文字
+            self.channel_combo.addItem(display_text, userData=ch_id)
 
     def set_rule_summary(
         self,
@@ -1263,6 +1405,7 @@ class TaskPage(ScrollPage):
         self._detail_label.setText(text)
 
     def set_queue_tasks(self, tasks: list[TaskRow]):
+        self._queue_table.setUpdatesEnabled(False)  # 暂停重绘
         self._queue_table.setRowCount(0)
         self._queue_count_badge.setText(str(len(tasks)))
         status_colors = {
@@ -1312,7 +1455,7 @@ class TaskPage(ScrollPage):
             ops_l.addWidget(del_btn)
             self._queue_table.setCellWidget(r, 5, ops_w)
             self._queue_table.setRowHeight(r, 44)
-
+        self._queue_table.setUpdatesEnabled(True)  # 恢复重绘
 
 # ──────────────────────────────────────────────────────────────
 #  登录中心

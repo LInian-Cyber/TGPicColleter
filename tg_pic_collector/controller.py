@@ -41,8 +41,13 @@ class AppController(QObject):
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode if self.config.use_last_mode else "default",
         )
+        
+        # 加载频道历史
+        channel_history = self.config.get_channel_history_with_avatars()
+        self.window.task_page.add_channel_history(channel_history)
+        
         if self.config.restore_on_launch:
-            self.window.task_page.channel_edit.setText(self.config.channel)
+            self.window.task_page.channel_combo.setText(self.config.channel)
             self.window.task_page.tag_edit.setText(self.config.tag)
         if self.config.auto_fill_tag and not self.window.task_page.tag_edit.text() and self.config.history:
             recent_tag = str(self.config.history[0].get("tag", "")).strip()
@@ -178,6 +183,8 @@ class AppController(QObject):
         self.worker.status_changed.connect(self.window.set_task_detail)
         self.worker.authorized.connect(self._on_authorized)
         self.worker.user_profile_updated.connect(self._on_user_profile_updated)
+        self.worker.channel_info_fetched.connect(self._on_channel_info_fetched)
+        self.worker.dialogs_loaded.connect(self._on_dialogs_loaded)
         self.worker.code_sent.connect(
             lambda phone: self.window.show_success(f"验证码已发送至 {phone}")
         )
@@ -216,10 +223,25 @@ class AppController(QObject):
         self.window.set_account(name, phone, "Telethon")
         self.window.set_session_status(True, "当前会话可正常使用")
         self.window.show_success(f"欢迎回来，{name}")
+        
+        # 自动加载对话列表
+        if self.worker:
+            self.worker.load_dialogs()
 
     def _on_user_profile_updated(self, name: str, phone: str, avatar_bytes: bytes) -> None:
         """处理用户头像更新"""
         self.window.login_page.set_user_avatar(avatar_bytes)
+    
+    def _on_channel_info_fetched(self, channel_id: str, channel_name: str, avatar_bytes: bytes) -> None:
+        """处理频道信息获取"""
+        self.config.add_channel_to_history(channel_id, channel_name, avatar_bytes)
+        # 刷新下拉列表
+        channel_history = self.config.get_channel_history_with_avatars()
+        self.window.task_page.add_channel_history(channel_history)
+
+    def _on_dialogs_loaded(self, dialogs: list[dict]) -> None:
+        """处理对话列表加载完成"""
+        self.window.task_page.add_channel_history(dialogs)
 
     def send_code(self, phone: str) -> None:
         if not phone:
