@@ -29,7 +29,7 @@ class AppConfig:
     lang: str = "zh_CN"
     history: list[dict] | None = None
     concurrency: int = 6
-    request_interval: float = 1.0
+    file_download_interval: float = 1.0
     filename_limit: int = 100
     empty_tag_action: str = "uncategorized"
     restore_on_launch: bool = True
@@ -148,6 +148,8 @@ class AppConfig:
             return probe
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if "file_download_interval" not in payload and "request_interval" in payload:
+                payload["file_download_interval"] = payload["request_interval"]
             valid = {key: value for key, value in payload.items() if key in cls.__dataclass_fields__}
             return cls(**valid)
         except (OSError, ValueError, TypeError):

@@ -8,6 +8,7 @@ from PySide6.QtGui import QDesktopServices
 from qfluentwidgets import Theme, setTheme
 
 from .config import AppConfig
+from .logger import get_logger
 from .models import PreviewRequest, SAVE_MODE_LABELS, ScanRequest, TelegramCredentials
 from .telegram_worker import TelegramWorker
 from .ui import HistoryRow, MainWindow, TaskRow
@@ -19,6 +20,7 @@ class AppController(QObject):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
+        self.logger = get_logger()
         self.window = MainWindow()
         self.worker: TelegramWorker | None = None
         self.authorized = False
@@ -73,7 +75,7 @@ class AppController(QObject):
             "save_mode": self.config.save_mode,
             "max_posts": self.config.max_posts,
             "concurrency": self.config.concurrency,
-            "request_interval": self.config.request_interval,
+            "file_download_interval": self.config.file_download_interval,
             "filename_limit": self.config.filename_limit,
             "empty_tag_action": self.config.empty_tag_action,
             "restore_on_launch": self.config.restore_on_launch,
@@ -115,6 +117,8 @@ class AppController(QObject):
         w.settings_logout_requested.connect(self.logout)
         w.settings_cache_clear_requested.connect(self.clear_cache)
         w.open_folder_requested.connect(self.open_folder)
+        w.open_log_requested.connect(self.open_log)
+        w.open_log_folder_requested.connect(self.open_log_folder)
         w.history_clear_requested.connect(self.clear_history)
         w.trend_period_changed.connect(self.refresh_trend)
         w.window_closing.connect(self.shutdown)
@@ -191,9 +195,11 @@ class AppController(QObject):
         self.worker.qr_ready.connect(self.window.show_qr)
         self.worker.password_required.connect(self._on_password_required)
         self.worker.auth_failed.connect(self.window.show_error)
+        self.worker.connection_failed.connect(self._on_worker_error)
         self.worker.logged_out.connect(self._on_logged_out)
         self.worker.scan_started.connect(lambda: self.window.set_task_busy(True))
         self.worker.scan_progress.connect(self._on_scan_progress)
+        self.worker.post_status_changed.connect(self._on_post_status_changed)
         self.worker.scan_finished.connect(self._on_scan_finished)
         self.worker.scan_failed.connect(self._on_scan_failed)
         self.worker.preview_progress.connect(self.window.set_search_preview_progress)
@@ -215,6 +221,17 @@ class AppController(QObject):
         self.window.set_session_status(authorized, "本地 Telethon Session 已加载" if authorized else "未登录")
         if not authorized:
             self.window.set_account()
+            self.window.set_qr_message("当前未登录，可刷新二维码或使用手机号登录")
+
+    def _on_worker_error(self, message: str) -> None:
+        self.authorized = False
+        self.window.set_session_status(False, f"Telegram 连接失败：{message}")
+        self.window.set_task_detail(f"Telegram 连接失败：{message}")
+        self.window.set_qr_message(
+            f"无法连接 Telegram\n{message}\n\n请检查网络后点击“刷新二维码”",
+            allow_auto_retry=True,
+        )
+        self.window.show_error(f"Telegram 连接失败：{message}")
 
     def _on_authorized(self, name: str, phone: str) -> None:
         self.authorized = True
@@ -230,7 +247,7 @@ class AppController(QObject):
 
     def _on_user_profile_updated(self, name: str, phone: str, avatar_bytes: bytes) -> None:
         """处理用户头像更新"""
-        self.window.login_page.set_user_avatar(avatar_bytes)
+        self.window.set_user_avatar(avatar_bytes)
     
     def _on_channel_info_fetched(self, channel_id: str, channel_name: str, avatar_bytes: bytes) -> None:
         """处理频道信息获取"""
@@ -315,7 +332,7 @@ class AppController(QObject):
             only_images=bool(params.get("only_images", True)),
             include_replies=bool(params.get("include_replies", True)),
             concurrency=max(1, int(self.config.concurrency)),
-            request_interval=max(0.0, float(self.config.request_interval)),
+            file_download_interval=max(0.0, float(self.config.file_download_interval)),
             filename_limit=max(20, int(self.config.filename_limit)),
             empty_tag_action=self.config.empty_tag_action,
         )
@@ -378,6 +395,7 @@ class AppController(QObject):
         if not self._ensure_worker() or not self.worker:
             return
         self.window.show_search_preview_loading(channel, tag)
+        self.window.set_search_preview_progress("正在准备搜索…")
         self.worker.start_preview(
             PreviewRequest(
                 channel=channel,
@@ -412,6 +430,8 @@ class AppController(QObject):
 
     def delete_task(self, index: int) -> None:
         if 0 <= index < len(self.queue):
+            if index == 0 and self.queue[index].status == "下载中":
+                self.cancel_task()
             self.queue.pop(index)
             self.window.set_task_queue(self.queue)
 
@@ -422,12 +442,36 @@ class AppController(QObject):
             self.queue[0].total = downloaded + skipped
             self.window.set_task_queue(self.queue)
 
+    def _on_post_status_changed(self, post_id: int, status: str) -> None:
+        if not self.queue:
+            return
+        task = self.queue[0]
+        task.post_statuses[post_id] = status
+        completed = sum(
+            1 for value in task.post_statuses.values() if value.startswith("已完成")
+        )
+        task.progress = int(completed * 100 / max(1, len(task.post_statuses)))
+        self.window.set_task_queue(self.queue)
+        self._refresh_log_view()
+
     def _on_scan_finished(self, posts: int, downloaded: int, skipped: int) -> None:
         self.window.set_task_busy(False)
         status = "已取消" if self.cancelled else "已完成"
         if self.queue:
             self.queue[0].status = status
-            self.queue[0].progress = 0 if self.cancelled else 100
+            if self.cancelled:
+                for post_id, post_status in self.queue[0].post_statuses.items():
+                    if not post_status.startswith("已完成"):
+                        self.queue[0].post_statuses[post_id] = "未完成 · 任务已取消"
+                completed = sum(
+                    1 for value in self.queue[0].post_statuses.values()
+                    if value.startswith("已完成")
+                )
+                self.queue[0].progress = int(
+                    completed * 100 / max(1, len(self.queue[0].post_statuses))
+                )
+            else:
+                self.queue[0].progress = 100
             self.queue[0].downloaded = downloaded
             self.queue[0].total = downloaded + skipped
             self.window.set_task_queue(self.queue)
@@ -455,7 +499,26 @@ class AppController(QObject):
         self.window.set_task_busy(False)
         if self.queue:
             self.queue[0].status = "已取消"
+            for post_id, status in self.queue[0].post_statuses.items():
+                if not status.startswith("已完成"):
+                    self.queue[0].post_statuses[post_id] = "未完成 · 任务失败"
             self.window.set_task_queue(self.queue)
+        if self.current_request:
+            downloaded = self.queue[0].downloaded if self.queue else 0
+            skipped = (self.queue[0].total - downloaded) if self.queue else 0
+            self.config.add_history(
+                {
+                    "channel": self.current_request.channel,
+                    "tag": self.current_request.tag,
+                    "status": "失败",
+                    "posts": len(self.queue[0].post_statuses) if self.queue else 0,
+                    "downloaded": downloaded,
+                    "skipped": skipped,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+            )
+            self._refresh_local_data()
+        self._refresh_log_view()
         self.window.show_error(f"任务失败：{message}")
 
     def save_settings(self, values: dict) -> None:
@@ -467,8 +530,8 @@ class AppController(QObject):
         self.config.save_mode = mode
         self.config.max_posts = int(values.get("max_posts", self.config.max_posts))
         self.config.concurrency = max(1, int(values.get("concurrency", self.config.concurrency)))
-        self.config.request_interval = max(
-            0.0, float(values.get("request_interval", self.config.request_interval))
+        self.config.file_download_interval = max(
+            0.0, float(values.get("file_download_interval", self.config.file_download_interval))
         )
         self.config.filename_limit = max(
             20, int(values.get("filename_limit", self.config.filename_limit))
@@ -532,6 +595,25 @@ class AppController(QObject):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(path.as_uri())
 
+    def open_log(self) -> None:
+        path = self.logger.get_log_path().resolve()
+        path.touch(exist_ok=True)
+        QDesktopServices.openUrl(path.as_uri())
+
+    def open_log_folder(self) -> None:
+        path = self.logger.log_dir.resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(path.as_uri())
+
+    def _refresh_log_view(self) -> None:
+        path = self.logger.get_log_path().resolve()
+        try:
+            content = path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            content = "无法读取日志文件。"
+        lines = content.splitlines()
+        self.window.set_log(str(path), "\n".join(lines[-300:]))
+
     def _refresh_local_data(self) -> None:
         history = self.config.history or []
         today_key = datetime.now().strftime("%Y-%m-%d")
@@ -577,6 +659,7 @@ class AppController(QObject):
                 for item in history
             ]
         )
+        self._refresh_log_view()
 
     def refresh_trend(self, period: str) -> None:
         history = self.config.history or []

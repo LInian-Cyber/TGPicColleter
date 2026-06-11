@@ -1,9 +1,13 @@
+import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import AsyncMock, PropertyMock, patch
 
+from tg_pic_collector.config import AppConfig
 from tg_pic_collector.models import PreviewRequest, ScanRequest, TelegramCredentials
 from tg_pic_collector.telegram_worker import TelegramWorker, is_image_message, safe_name
 
@@ -90,6 +94,79 @@ class TelegramWorkerHelperTests(TestCase):
 
 
 class TelegramPreviewTests(IsolatedAsyncioTestCase):
+    async def test_scan_emits_post_level_completion_status(self) -> None:
+        post = SimpleNamespace(
+            id=42,
+            message="#cats",
+            replies=SimpleNamespace(replies=1),
+        )
+        image = SimpleNamespace(
+            id=99,
+            photo=object(),
+            document=None,
+            file=SimpleNamespace(name="photo.jpg", mime_type="image/jpeg"),
+            date=None,
+        )
+
+        class FakeClient:
+            async def get_entity(self, _):
+                return SimpleNamespace(title="Demo Channel", username="demo", id=1)
+
+            async def download_profile_photo(self, *_args, **_kwargs):
+                return b""
+
+            def iter_messages(self, _, search=None, limit=None, reply_to=None):
+                async def items():
+                    yield image if reply_to else post
+
+                return items()
+
+            async def download_media(self, _message, file):
+                return file
+
+        with TemporaryDirectory() as directory:
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", Path(directory) / "session")
+            )
+            statuses = []
+            worker.post_status_changed.connect(
+                lambda post_id, status: statuses.append((post_id, status))
+            )
+            await worker._scan(
+                FakeClient(),
+                ScanRequest(
+                    "@demo",
+                    "#cats",
+                    Path(directory),
+                    "tag",
+                    max_posts=10,
+                    file_download_interval=0,
+                ),
+            )
+
+        self.assertEqual(statuses[0], (42, "正在处理"))
+        self.assertTrue(statuses[-1][1].startswith("已完成 · 下载 1"))
+
+    async def test_file_download_interval_is_applied_after_media_download(self) -> None:
+        client = SimpleNamespace(download_media=AsyncMock(return_value="downloaded.jpg"))
+        semaphore = asyncio.Semaphore(1)
+
+        with patch(
+            "tg_pic_collector.telegram_worker.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            result = await TelegramWorker._download_media(
+                client,
+                SimpleNamespace(id=7),
+                Path("downloaded.jpg"),
+                semaphore,
+                0.5,
+            )
+
+        self.assertTrue(result)
+        client.download_media.assert_awaited_once()
+        sleep.assert_awaited_once_with(0.5)
+
     async def test_preview_returns_post_summary_and_image_count(self) -> None:
         post = SimpleNamespace(
             id=42,
@@ -133,3 +210,22 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["post_id"], 42)
         self.assertEqual(rows[0]["image_count"], 1)
         self.assertEqual(rows[0]["thumbnails"], [b"thumbnail"])
+
+
+class AppConfigTests(TestCase):
+    def test_legacy_request_interval_is_migrated(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_dir = Path(directory)
+            (config_dir / "config.json").write_text(
+                json.dumps({"request_interval": 2.5}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                AppConfig,
+                "config_dir",
+                new_callable=PropertyMock,
+                return_value=config_dir,
+            ):
+                config = AppConfig.load()
+
+        self.assertEqual(config.file_download_interval, 2.5)

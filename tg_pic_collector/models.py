@@ -28,7 +28,7 @@ class ScanRequest:
     only_images: bool = True
     include_replies: bool = True
     concurrency: int = 6
-    request_interval: float = 1.0
+    file_download_interval: float = 1.0
     filename_limit: int = 100
     empty_tag_action: str = "uncategorized"  # uncategorized | skip | channel
 

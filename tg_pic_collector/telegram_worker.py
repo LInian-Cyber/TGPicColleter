@@ -12,6 +12,7 @@ from typing import Any
 from PySide6.QtCore import QThread, Signal
 from telethon import TelegramClient, errors
 
+from .logger import get_logger
 from .models import PreviewRequest, ScanRequest, TelegramCredentials
 
 try:
@@ -69,9 +70,11 @@ class TelegramWorker(QThread):
     qr_ready = Signal(str)
     password_required = Signal()
     auth_failed = Signal(str)
+    connection_failed = Signal(str)
     logged_out = Signal()
     scan_started = Signal()
     scan_progress = Signal(int, int, str)
+    post_status_changed = Signal(int, str)
     scan_finished = Signal(int, int, int)
     scan_failed = Signal(str)
     preview_started = Signal()
@@ -90,6 +93,7 @@ class TelegramWorker(QThread):
         self.cancel_event = threading.Event()
         self.preview_cancel_event = threading.Event()
         self.qr_cancel_event = threading.Event()
+        self.logger = get_logger()
         self._phone_code_hash: str | None = None
         self._phone = credentials.phone
         # 搜索预览缓存：{(channel, tag): results}
@@ -139,7 +143,9 @@ class TelegramWorker(QThread):
         try:
             asyncio.run(self._main())
         except Exception as exc:
-            self.auth_failed.emit(str(exc))
+            message = str(exc) or exc.__class__.__name__
+            self.status_changed.emit(f"连接失败：{message}")
+            self.connection_failed.emit(message)
 
     async def _main(self) -> None:
         self.credentials.session_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,11 +157,22 @@ class TelegramWorker(QThread):
             str(self.credentials.session_path),
             self.credentials.api_id,
             self.credentials.api_hash,
+            timeout=10,
+            connection_retries=2,
+            retry_delay=1,
         )
         self.status_changed.emit("正在连接 Telegram…")
-        await client.connect()
         try:
-            authorized = await client.is_user_authorized()
+            await asyncio.wait_for(client.connect(), timeout=25)
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError("连接 Telegram 超时，请检查网络或代理设置") from exc
+        if not client.is_connected():
+            raise ConnectionError("无法连接 Telegram，请检查网络或代理设置")
+        try:
+            try:
+                authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=15)
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError("检查 Telegram 会话超时，请稍后重试") from exc
             self.ready.emit(authorized)
             if authorized:
                 await self._emit_identity(client)
@@ -271,7 +288,10 @@ class TelegramWorker(QThread):
         
         # 获取用户头像
         try:
-            avatar_bytes = await client.download_profile_photo(me, file=bytes)
+            avatar_bytes = await asyncio.wait_for(
+                client.download_profile_photo(me, file=bytes),
+                timeout=8,
+            )
             if isinstance(avatar_bytes, bytes):
                 self.user_profile_updated.emit(
                     display_name or me.username or phone or "Telegram 用户",
@@ -289,6 +309,7 @@ class TelegramWorker(QThread):
     async def _load_dialogs(self, client: TelegramClient) -> None:
         """加载用户的对话列表（频道、群组等）"""
         try:
+            self.status_changed.emit("正在加载频道列表…")
             dialogs = []
             async for dialog in client.iter_dialogs(limit=100):
                 entity = dialog.entity
@@ -320,28 +341,37 @@ class TelegramWorker(QThread):
                 if not display_id:
                     continue
                 
-                # 获取头像
-                avatar_bytes = b""
-                try:
-                    avatar_data = await client.download_profile_photo(entity, file=bytes)
-                    if isinstance(avatar_data, bytes):
-                        avatar_bytes = avatar_data
-                except Exception:
-                    pass
-                
                 dialogs.append({
                     "name": name,
                     "id": display_id,
-                    "avatar": avatar_bytes,
+                    "avatar": b"",
+                    "_entity": entity,
                     "type": entity_type
                 })
             
-            # 按名称排序
+            # UI 最多展示 20 个频道。头像并发加载并设置超时，避免阻塞后续任务。
             dialogs.sort(key=lambda x: x["name"].lower())
+            dialogs = dialogs[:20]
+
+            async def load_avatar(item: dict) -> None:
+                try:
+                    avatar_data = await asyncio.wait_for(
+                        client.download_profile_photo(item["_entity"], file=bytes),
+                        timeout=4,
+                    )
+                    if isinstance(avatar_data, bytes):
+                        item["avatar"] = avatar_data
+                except Exception:
+                    pass
+                item.pop("_entity", None)
+
+            await asyncio.gather(*(load_avatar(item) for item in dialogs))
             self.dialogs_loaded.emit(dialogs)
+            self.status_changed.emit("会话有效")
             
-        except Exception as exc:
+        except Exception:
             self.dialogs_loaded.emit([])
+            self.status_changed.emit("会话有效")
 
     async def _scan(self, client: TelegramClient, request: ScanRequest) -> None:
         self.scan_started.emit()
@@ -349,26 +379,69 @@ class TelegramWorker(QThread):
         downloaded = 0
         skipped = 0
         semaphore = asyncio.Semaphore(max(1, request.concurrency))
-        pending: set[asyncio.Task[bool]] = set()
+        pending: dict[asyncio.Task[bool], tuple[int, Path]] = {}
         reserved_targets: set[Path] = set()
+        post_downloads: dict[int, int] = {}
+        post_skips: dict[int, int] = {}
+
+        def record_file(
+                post_id: int,
+                target: Path,
+                success: bool,
+                reason: str = "",
+        ) -> None:
+            nonlocal downloaded, skipped
+            if success:
+                downloaded += 1
+                post_downloads[post_id] = post_downloads.get(post_id, 0) + 1
+                self.logger.file_downloaded(post_id, str(target))
+            else:
+                skipped += 1
+                post_skips[post_id] = post_skips.get(post_id, 0) + 1
+                self.logger.file_skipped(post_id, str(target), reason or "已存在或下载失败")
+            self.scan_progress.emit(downloaded, skipped, f"帖子 #{post_id}")
+
+        def begin_post(post: Any) -> None:
+            post_id = int(post.id)
+            has_replies = bool(
+                getattr(getattr(post, "replies", None), "replies", 0) or 0
+            )
+            self.logger.post_scanning(post_id, has_replies)
+            self.post_status_changed.emit(post_id, "正在处理")
 
         async def collect_finished(wait_all: bool = False) -> None:
-            nonlocal downloaded, skipped, pending
             if not pending:
                 return
-            done, still_pending = await asyncio.wait(
-                pending,
+            done, _ = await asyncio.wait(
+                set(pending),
                 return_when=asyncio.ALL_COMPLETED if wait_all else asyncio.FIRST_COMPLETED,
             )
-            pending = set(still_pending)
             for task in done:
-                if task.result():
-                    downloaded += 1
-                else:
-                    skipped += 1
-                self.scan_progress.emit(downloaded, skipped, "正在下载评论区媒体")
+                post_id, target = pending.pop(task)
+                try:
+                    success = task.result()
+                    record_file(post_id, target, success, "" if success else "下载未返回文件")
+                except Exception as exc:
+                    self.logger.error(f"下载失败 - 帖子 #{post_id}: {target} ({exc})")
+                    record_file(post_id, target, False, f"下载失败: {exc}")
+
+        async def finish_post(post_id: int) -> None:
+            await collect_finished(wait_all=True)
+            downloaded_count = post_downloads.get(post_id, 0)
+            skipped_count = post_skips.get(post_id, 0)
+            if self.cancel_event.is_set():
+                status = "未完成 · 任务已取消"
+            elif downloaded_count:
+                status = f"已完成 · 下载 {downloaded_count} · 跳过 {skipped_count}"
+            elif skipped_count:
+                status = f"已完成 · 无新增文件（跳过 {skipped_count}）"
+            else:
+                status = "已完成 · 未发现可下载文件"
+            self.post_status_changed.emit(post_id, status)
+            self.logger.info(f"帖子 #{post_id}: {status}")
 
         try:
+            self.logger.task_started(request.channel, request.tag)
             channel_ref = request.channel.strip()
             entity_ref: str | int = (
                 int(channel_ref) if channel_ref.lstrip("-").isdigit() else channel_ref
@@ -422,6 +495,7 @@ class TelegramWorker(QThread):
                         if not post:
                             continue
                         
+                        begin_post(post)
                         self.status_changed.emit(f"正在下载帖子 #{post.id} 的评论区图片")
                         
                         # 提取按钮链接
@@ -436,26 +510,18 @@ class TelegramWorker(QThread):
                                 )
                                 if target.exists():
                                     if request.skip_duplicates or request.duplicate_mode == "skip":
-                                        skipped += 1
-                                        self.scan_progress.emit(
-                                            downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                                        )
+                                        record_file(post.id, target, False, "原图链接已存在")
                                     else:
                                         if request.duplicate_mode == "rename":
                                             target = self._available_target(target)
                                         self._write_url_shortcut(target, original_url)
-                                        downloaded += 1
-                                        self.scan_progress.emit(
-                                            downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                                        )
+                                        record_file(post.id, target, True)
                                 else:
                                     self._write_url_shortcut(target, original_url)
-                                    downloaded += 1
-                                    self.scan_progress.emit(
-                                        downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                                    )
+                                    record_file(post.id, target, True)
 
                         if not request.include_replies:
+                            await finish_post(post.id)
                             continue
 
                         try:
@@ -482,30 +548,31 @@ class TelegramWorker(QThread):
                                 target = target_dir / f"{stem}{suffix}"
                                 if target.exists() or target in reserved_targets:
                                     if request.skip_duplicates or request.duplicate_mode == "skip":
-                                        skipped += 1
-                                        self.scan_progress.emit(downloaded, skipped, f"帖子 #{post.id}")
+                                        record_file(post.id, target, False, "文件已存在")
                                         continue
                                     if request.duplicate_mode == "rename":
                                         target = self._available_target(target, reserved_targets)
                                 elif target in reserved_targets:
                                     await collect_finished(wait_all=True)
                                 reserved_targets.add(target)
-                                pending.add(
-                                    asyncio.create_task(
-                                        self._download_media(
-                                            client,
-                                            comment,
-                                            target,
-                                            semaphore,
-                                            request.request_interval,
-                                        )
+                                download_task = asyncio.create_task(
+                                    self._download_media(
+                                        client,
+                                        comment,
+                                        target,
+                                        semaphore,
+                                        request.file_download_interval,
                                     )
                                 )
+                                pending[download_task] = (int(post.id), target)
                                 if len(pending) >= max(1, request.concurrency):
                                     await collect_finished()
                         except errors.RPCError:
                             pass
-                    except Exception:
+                        await finish_post(post.id)
+                    except Exception as exc:
+                        self.logger.error(f"帖子 #{post_id} 处理失败: {exc}")
+                        self.post_status_changed.emit(int(post_id), f"未完成 · {exc}")
                         continue
             else:
                 # 没有缓存，正常扫描
@@ -520,6 +587,7 @@ class TelegramWorker(QThread):
                         continue
 
                     matched_posts += 1
+                    begin_post(post)
                     self.status_changed.emit(f"正在检查帖子 #{post.id} 的评论")
                     if request.extract_button_link:
                         button_link = self._find_button_url(post, request.button_keyword)
@@ -532,26 +600,18 @@ class TelegramWorker(QThread):
                             )
                             if target.exists():
                                 if request.skip_duplicates or request.duplicate_mode == "skip":
-                                    skipped += 1
-                                    self.scan_progress.emit(
-                                        downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                                    )
+                                    record_file(post.id, target, False, "原图链接已存在")
                                 else:
                                     if request.duplicate_mode == "rename":
                                         target = self._available_target(target)
                                     self._write_url_shortcut(target, original_url)
-                                    downloaded += 1
-                                    self.scan_progress.emit(
-                                        downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                                    )
+                                    record_file(post.id, target, True)
                             else:
                                 self._write_url_shortcut(target, original_url)
-                                downloaded += 1
-                                self.scan_progress.emit(
-                                    downloaded, skipped, f"帖子 #{post.id} · 原图链接"
-                                )
+                                record_file(post.id, target, True)
 
                     if not request.include_replies:
+                        await finish_post(post.id)
                         continue
 
                     try:
@@ -578,38 +638,42 @@ class TelegramWorker(QThread):
                             target = target_dir / f"{stem}{suffix}"
                             if target.exists() or target in reserved_targets:
                                 if request.skip_duplicates or request.duplicate_mode == "skip":
-                                    skipped += 1
-                                    self.scan_progress.emit(downloaded, skipped, f"帖子 #{post.id}")
+                                    record_file(post.id, target, False, "文件已存在")
                                     continue
                                 if request.duplicate_mode == "rename":
                                     target = self._available_target(target, reserved_targets)
                             elif target in reserved_targets:
                                 await collect_finished(wait_all=True)
                             reserved_targets.add(target)
-                            pending.add(
-                                asyncio.create_task(
-                                    self._download_media(
-                                        client,
-                                        comment,
-                                        target,
-                                        semaphore,
-                                        request.request_interval,
-                                    )
+                            download_task = asyncio.create_task(
+                                self._download_media(
+                                    client,
+                                    comment,
+                                    target,
+                                    semaphore,
+                                    request.file_download_interval,
                                 )
                             )
+                            pending[download_task] = (int(post.id), target)
                             if len(pending) >= max(1, request.concurrency):
                                 await collect_finished()
                     except errors.RPCError:
                         # 该帖子没有评论区或评论区不可访问，跳过继续处理下一条帖子
                         pass
+                    await finish_post(post.id)
 
             await collect_finished(wait_all=True)
 
+            self.logger.task_completed(
+                matched_posts, downloaded, skipped, self.cancel_event.is_set()
+            )
             self.scan_finished.emit(matched_posts, downloaded, skipped)
             self.status_changed.emit("任务已取消" if self.cancel_event.is_set() else "下载完成")
         except errors.FloodWaitError as exc:
+            self.logger.error(f"Telegram 限流，需要等待 {exc.seconds} 秒")
             self.scan_failed.emit(f"Telegram 要求等待 {exc.seconds} 秒后重试")
         except Exception as exc:
+            self.logger.error(f"任务失败: {exc}")
             self.scan_failed.emit(str(exc))
         finally:
             for task in pending:
@@ -690,8 +754,6 @@ class TelegramWorker(QThread):
             # 保存到缓存
             self._preview_cache[cache_key] = results
             self.preview_finished.emit(results)
-
-            self.preview_finished.emit(results)
         except errors.FloodWaitError as exc:
             self.preview_failed.emit(f"Telegram 要求等待 {exc.seconds} 秒后重试")
         except Exception as exc:
@@ -717,12 +779,12 @@ class TelegramWorker(QThread):
             message: Any,
             target: Path,
             semaphore: asyncio.Semaphore,
-            request_interval: float,
+            file_download_interval: float,
     ) -> bool:
         async with semaphore:
             result = await client.download_media(message, file=str(target))
-            if request_interval > 0:
-                await asyncio.sleep(request_interval)
+            if file_download_interval > 0:
+                await asyncio.sleep(file_download_interval)
             return bool(result)
 
     @staticmethod
