@@ -8,6 +8,7 @@ class HistoryPage(ScrollPage):
     open_folder_requested = Signal()
     pause_task_requested = Signal(int)
     delete_task_requested = Signal(int)
+    delete_history_requested = Signal(int)
     pause_all_requested = Signal()
     clear_queue_requested = Signal()
     open_log_requested = Signal()
@@ -69,7 +70,15 @@ class HistoryPage(ScrollPage):
         self._queue_table.verticalHeader().hide()
         self._queue_table.horizontalHeader().setStretchLastSection(False)
         self._queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self._queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self._queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self._queue_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self._queue_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self._queue_table.setColumnWidth(1, 90)
+        self._queue_table.setColumnWidth(2, 70)
+        self._queue_table.setColumnWidth(3, 160)
+        self._queue_table.setColumnWidth(5, 72)
         self._queue_table.setShowGrid(False)
         self._queue_table.setAlternatingRowColors(False)
         self._queue_table.setMinimumHeight(300)
@@ -98,12 +107,15 @@ class HistoryPage(ScrollPage):
         acts.addWidget(clear_btn)
         card.body.addLayout(acts)
 
-        self._table = PassiveTableWidget(0, 6)
+        self._table = PassiveTableWidget(0, 7)
         self._table.setHorizontalHeaderLabels(
-            ["频道", "Tag", "状态", "匹配帖子", "下载图片", "完成时间"])
+            ["频道", "Tag", "状态", "匹配帖子", "下载图片", "完成时间", "操作"])
         self._table.verticalHeader().hide()
-        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setStretchLastSection(False)
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(6, 58)
         self._table.setShowGrid(False)
         self._table.setAlternatingRowColors(False)
         self._table.setMinimumHeight(420)
@@ -187,7 +199,11 @@ class HistoryPage(ScrollPage):
 
             skipped = getattr(task, "skipped", 0)
             completed = task.downloaded + skipped
-            result_item = QTableWidgetItem(f"已完成 {completed} / 共 {task.total} (下载 {task.downloaded} / 跳过 {skipped})")
+            total_text = str(task.total) if task.total > 0 else "扫描中"
+            result_item = QTableWidgetItem(
+                f"已完成 {completed} / 总数 {total_text} "
+                f"(下载 {task.downloaded} / 跳过 {skipped})"
+            )
             result_item.setToolTip(tooltip)
             self._queue_table.setItem(row, 4, result_item)
 
@@ -195,12 +211,20 @@ class HistoryPage(ScrollPage):
             ops_layout = QHBoxLayout(ops_widget)
             ops_layout.setContentsMargins(4, 4, 4, 4)
             ops_layout.setSpacing(4)
-            pause_btn = ToolButton(FIF.PAUSE)
+            # 暂停/继续 按钮：根据当前状态切换图标和 tooltip
+            is_paused = task.status == "已暂停"
+            pause_icon = FIF.PLAY if is_paused else FIF.PAUSE
+            pause_tip  = "继续" if is_paused else "暂停"
+            pause_btn = ToolButton(pause_icon)
             pause_btn.setFixedSize(28, 28)
+            pause_btn.setToolTip(pause_tip)
             pause_btn.clicked.connect(lambda _, idx=index: self.pause_task_requested.emit(idx))
             delete_btn = ToolButton(FIF.DELETE)
             delete_btn.setFixedSize(28, 28)
-            delete_btn.clicked.connect(lambda _, idx=index: self.delete_task_requested.emit(idx))
+            delete_btn.setToolTip("删除")
+            delete_btn.clicked.connect(
+                lambda checked=False, idx=index: self.delete_task_requested.emit(idx)
+            )
             ops_layout.addWidget(pause_btn)
             ops_layout.addWidget(delete_btn)
             self._queue_table.setCellWidget(row, 5, ops_widget)
@@ -215,7 +239,7 @@ class HistoryPage(ScrollPage):
 
     def set_rows(self, rows: list[HistoryRow]):
         self._table.setRowCount(0)
-        for rec in rows:
+        for index, rec in enumerate(rows):
             r = self._table.rowCount()
             self._table.insertRow(r)
             vals = [
@@ -236,4 +260,17 @@ class HistoryPage(ScrollPage):
                     }.get(v, C_MUTED)
                     item.setForeground(QColor(color))
                 self._table.setItem(r, c, item)
+            delete_btn = ToolButton(FIF.DELETE)
+            delete_btn.setFixedSize(28, 28)
+            delete_btn.setToolTip("删除这条历史记录")
+            delete_btn.clicked.connect(
+                lambda checked=False, idx=index: self.delete_history_requested.emit(idx)
+            )
+            ops_widget = QWidget()
+            ops_layout = QHBoxLayout(ops_widget)
+            ops_layout.setContentsMargins(4, 4, 4, 4)
+            ops_layout.addStretch()
+            ops_layout.addWidget(delete_btn)
+            ops_layout.addStretch()
+            self._table.setCellWidget(r, 6, ops_widget)
             self._table.setRowHeight(r, 38)

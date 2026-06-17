@@ -18,6 +18,7 @@ class AppConfig:
     save_root: str = str(Path.home() / "Pictures" / "TG Pic Collector")
     save_mode: str = "channel_tag"
     max_posts: int = 100
+    preview_max_results: int = 50
     session_name: str = "default"
     session_dir: str = ""
     skip_duplicates: bool = True
@@ -29,7 +30,7 @@ class AppConfig:
     lang: str = "zh_CN"
     history: list[dict] | None = None
     concurrency: int = 6
-    file_download_interval: float = 1.0
+    file_download_interval: float = 0.5
     filename_limit: int = 100
     empty_tag_action: str = "uncategorized"
     restore_on_launch: bool = True
@@ -37,9 +38,11 @@ class AppConfig:
     auto_fill_tag: bool = True
     enable_animations: bool = True
     enable_rounded_corners: bool = True
+    enable_system_notifications: bool = True
     use_dpapi_encryption: bool = True
     last_task_state: dict | None = None
-    channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "avatar_path": "path/to/avatar.jpg"}, ...]
+    channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "link": "https://t.me/xxx", "avatar_path": "..."}]
+    advanced_rules: list[dict] | None = None  # [{"name": str, "description": str, "json": str}]
 
     @property
     def config_dir(self) -> Path:
@@ -66,19 +69,33 @@ class AppConfig:
         self.history = history[:100]
         self.save()
 
-    def add_channel_to_history(self, channel_id: str, channel_name: str = "", avatar_bytes: bytes = b"") -> None:
+    def add_channel_to_history(
+        self,
+        channel_id: str,
+        channel_name: str = "",
+        avatar_bytes: bytes = b"",
+        channel_link: str = "",
+    ) -> None:
         """添加频道到历史记录"""
         history = list(self.channel_history or [])
+        channel_id = str(channel_id or "").strip()
+        channel_name = str(channel_name or "").strip()
+        channel_link = str(channel_link or "").strip() or self._channel_display_link(channel_id)
+        if not channel_id:
+            return
         
         # 检查是否已存在
-        for item in history:
+        for index, item in enumerate(history):
             if item.get("id") == channel_id:
                 # 更新已存在的记录
                 item["name"] = channel_name or item.get("name", "")
+                item["link"] = channel_link or item.get("link", "")
                 if avatar_bytes:
                     avatar_path = self._save_channel_avatar(channel_id, avatar_bytes)
                     if avatar_path:
                         item["avatar_path"] = avatar_path
+                # 最近搜索过的频道放到最前面，方便下次直接选。
+                history.insert(0, history.pop(index))
                 self.channel_history = history
                 self.save()
                 return
@@ -92,10 +109,19 @@ class AppConfig:
         history.insert(0, {
             "id": channel_id,
             "name": channel_name,
+            "link": channel_link,
             "avatar_path": avatar_path,
         })
         self.channel_history = history[:20]  # 最多保存20个频道
         self.save()
+
+    @staticmethod
+    def _channel_display_link(channel_id: str) -> str:
+        if channel_id.startswith("@") and len(channel_id) > 1:
+            return f"https://t.me/{channel_id[1:]}"
+        if channel_id.startswith("-100") and channel_id[4:].isdigit():
+            return f"https://t.me/c/{channel_id[4:]}"
+        return channel_id
     
     def _save_channel_avatar(self, channel_id: str, avatar_bytes: bytes) -> str:
         """保存频道头像到本地，返回相对路径"""
@@ -135,6 +161,7 @@ class AppConfig:
             result.append({
                 "id": item.get("id", ""),
                 "name": item.get("name", ""),
+                "link": item.get("link", "") or self._channel_display_link(str(item.get("id", ""))),
                 "avatar": avatar_bytes,
             })
         

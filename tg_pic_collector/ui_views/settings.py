@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
 
@@ -7,6 +9,7 @@ class SettingsPage(ScrollPage):
     save_requested = Signal(dict)   # emit settings dict
     logout_requested = Signal()
     cache_clear_requested = Signal()
+    language_preview_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__("settingsPage", parent)
@@ -89,20 +92,34 @@ class SettingsPage(ScrollPage):
             self.mode_combo.addItem(text, userData=key)
         dl.body.addWidget(self.mode_combo)
         dl.body.addWidget(_muted("按每个 Tag 自动创建独立文件夹，便于分类管理。"))
-        dl.body.addWidget(StrongBodyLabel("默认检查帖子数量"))
+        dl.body.addWidget(StrongBodyLabel("每次最多检查帖子数量"))
         self.max_posts = SpinBox()
         self.max_posts.setRange(1, 5000)
         self.max_posts.setValue(200)
-        self.max_posts.setMinimumSize(140, 36)
+        self.max_posts.setMinimumSize(180, 36)
         dl.body.addWidget(self.max_posts)
+        dl.body.addWidget(_muted(
+            "该数值限制每次从频道中检查的帖子数量，不是图片数量；"
+            "每篇帖子内符合条件的图片和正文原图链接都会继续处理。"
+        ))
+        dl.body.addWidget(StrongBodyLabel("搜索预览最多展示帖子数"))
+        self.preview_max_results = SpinBox()
+        self.preview_max_results.setRange(10, 500)
+        self.preview_max_results.setValue(50)
+        self.preview_max_results.setMinimumSize(180, 36)
+        dl.body.addWidget(self.preview_max_results)
+        dl.body.addWidget(_muted(
+            "超过该数量的匹配帖子仍会计入总数，但不会加载评论区图片和缩略图。"
+        ))
         grid.addWidget(dl, 0, 0)
 
         # 启动行为
-        launch = SurfaceCard("启动行为")
+        launch = SurfaceCard("应用行为")
         for label, desc, attr in [
             ("启动时恢复上次下载配置", "应用启动时自动恢复上次会话和下载配置。", "restore_cb"),
             ("默认沿用上次模式", "新建任务时自动沿用上一次使用的保存模式。", "last_mode_cb"),
             ("新建任务时自动带入最近 Tag", "从最近使用的 Tag 列表中自动填充。", "auto_tag_cb"),
+            ("显示系统完成通知", "扫描完成和下载完成时显示系统级通知。", "notification_sw"),
         ]:
             row = QHBoxLayout()
             row.setSpacing(12)
@@ -151,7 +168,7 @@ class SettingsPage(ScrollPage):
         self.interval_spin.setRange(0, 10)
         self.interval_spin.setSingleStep(0.1)
         self.interval_spin.setDecimals(1)
-        self.interval_spin.setValue(1.0)
+        self.interval_spin.setValue(0.5)
         self.interval_spin.setMinimumSize(140, 36)
         card.body.addWidget(self.interval_spin)
         card.body.addWidget(_muted(
@@ -297,10 +314,16 @@ class SettingsPage(ScrollPage):
         enc_row.addWidget(StrongBodyLabel("本地加密存储"))
         enc_row.addStretch()
         self.encrypt_sw = SwitchButton()
-        self.encrypt_sw.setChecked(True)
+        self.encrypt_sw.setChecked(sys.platform == "win32")
+        self.encrypt_sw.setEnabled(sys.platform == "win32")
         enc_row.addWidget(self.encrypt_sw)
         api_card.body.addLayout(enc_row)
-        api_card.body.addWidget(_muted("使用系统 DPAPI 加密存储会话文件。"))
+        encryption_note = (
+            "使用 Windows DPAPI 加密存储会话文件。"
+            if sys.platform == "win32"
+            else "当前系统不支持 Windows DPAPI，会话文件由当前用户目录权限保护。"
+        )
+        api_card.body.addWidget(_muted(encryption_note))
 
         ops_row = QHBoxLayout()
 
@@ -369,10 +392,14 @@ class SettingsPage(ScrollPage):
         theme_row.addStretch()
         self._theme_radios["auto"].setChecked(True)
         theme_card.body.addLayout(theme_row)
+        theme_card.body.addWidget(_muted("明暗主题切换当前可用，保存设置后立即生效。"))
         grid.addWidget(theme_card, 0, 0)
 
         # 动画与圆角
-        anim_card = SurfaceCard("界面效果")
+        anim_card = SurfaceCard(
+            "界面效果 · Coming soon",
+            "动画和圆角风格切换仍在开发中，当前使用应用默认样式。",
+        )
         for label, desc, attr in [
             ("启用动画效果", "提供更流畅的界面动效体验。", "anim_sw"),
             ("圆角样式", "使用圆角卡片与控件样式（推荐）。", "round_sw"),
@@ -386,6 +413,7 @@ class SettingsPage(ScrollPage):
             row.addLayout(text_v, 1)
             sw = SwitchButton()
             sw.setChecked(True)
+            sw.setEnabled(False)
             setattr(self, attr, sw)
             row.addWidget(sw)
             anim_card.body.addLayout(row)
@@ -393,10 +421,15 @@ class SettingsPage(ScrollPage):
         grid.addWidget(anim_card, 0, 1)
 
         # 语言
-        lang_card = SurfaceCard("语言（Language）")
+        lang_card = SurfaceCard("语言（Language）", "选择界面语言，切换后立即生效。")
         self.lang_combo = ComboBox()
         self.lang_combo.addItem("简体中文", userData="zh_CN")
         self.lang_combo.addItem("English", userData="en_US")
+        self.lang_combo.currentIndexChanged.connect(
+            lambda: self.language_preview_requested.emit(
+                self.lang_combo.currentData() or "zh_CN"
+            )
+        )
         lang_card.body.addWidget(self.lang_combo)
         grid.addWidget(lang_card, 1, 0)
 
@@ -444,10 +477,11 @@ class SettingsPage(ScrollPage):
     def _restore_defaults(self):
         self.path_edit.setText("")
         self.max_posts.setValue(200)
+        self.preview_max_results.setValue(50)
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData("channel_tag")))
         self.preserve_original_sw.setChecked(True)
         self.concurrency_spin.setValue(6)
-        self.interval_spin.setValue(1.0)
+        self.interval_spin.setValue(0.5)
         self.fn_len_spin.setValue(100)
         self.tag_empty_combo.setCurrentIndex(
             max(0, self.tag_empty_combo.findData("uncategorized"))
@@ -455,6 +489,7 @@ class SettingsPage(ScrollPage):
         self.restore_cb.setChecked(True)
         self.last_mode_cb.setChecked(True)
         self.auto_tag_cb.setChecked(True)
+        self.notification_sw.setChecked(True)
 
     def _collect(self) -> dict:
         mode = self.mode_combo.currentData() or "channel_tag"
@@ -464,6 +499,7 @@ class SettingsPage(ScrollPage):
             "save_root": self.path_edit.text().strip(),
             "save_mode": mode,
             "max_posts": self.max_posts.value(),
+            "preview_max_results": self.preview_max_results.value(),
             "concurrency": self.concurrency_spin.value(),
             "file_download_interval": float(self.interval_spin.value()),
             "filename_limit": self.fn_len_spin.value(),
@@ -471,6 +507,7 @@ class SettingsPage(ScrollPage):
             "restore_on_launch": self.restore_cb.isChecked(),
             "use_last_mode": self.last_mode_cb.isChecked(),
             "auto_fill_tag": self.auto_tag_cb.isChecked(),
+            "enable_system_notifications": self.notification_sw.isChecked(),
             "skip_duplicates": dup,
             "filename_template": self.filename_edit.text().strip(),
             "preserve_original_name": self.preserve_original_sw.isChecked(),
@@ -479,10 +516,8 @@ class SettingsPage(ScrollPage):
             "session_name": self.session_edit.text().strip() or "default",
             "session_path": self.session_path_edit.text().strip(),
             "theme_mode": theme,
-            "lang": self.lang_combo.currentData(),
+            "lang": self.lang_combo.currentData() or "zh_CN",
             "open_after_download": self.auto_open_sw.isChecked(),
-            "enable_animations": self.anim_sw.isChecked(),
-            "enable_rounded_corners": self.round_sw.isChecked(),
             "use_dpapi_encryption": self.encrypt_sw.isChecked(),
         }
 
@@ -510,6 +545,8 @@ class SettingsPage(ScrollPage):
                 rb.setChecked(True)
         if "max_posts" in d:
             self.max_posts.setValue(int(d["max_posts"]))
+        if "preview_max_results" in d:
+            self.preview_max_results.setValue(int(d["preview_max_results"]))
         if "concurrency" in d:
             self.concurrency_spin.setValue(int(d["concurrency"]))
         if "file_download_interval" in d:
@@ -526,6 +563,8 @@ class SettingsPage(ScrollPage):
             self.last_mode_cb.setChecked(bool(d["use_last_mode"]))
         if "auto_fill_tag" in d:
             self.auto_tag_cb.setChecked(bool(d["auto_fill_tag"]))
+        if "enable_system_notifications" in d:
+            self.notification_sw.setChecked(bool(d["enable_system_notifications"]))
         if "skip_duplicates" in d:
             key = d["skip_duplicates"]
             if isinstance(key, bool):
@@ -553,7 +592,9 @@ class SettingsPage(ScrollPage):
         if "enable_rounded_corners" in d:
             self.round_sw.setChecked(bool(d["enable_rounded_corners"]))
         if "use_dpapi_encryption" in d:
-            self.encrypt_sw.setChecked(bool(d["use_dpapi_encryption"]))
+            self.encrypt_sw.setChecked(
+                sys.platform == "win32" and bool(d["use_dpapi_encryption"])
+            )
 
     def set_session_status(self, loaded: bool, message: str = ""):
         if loaded:

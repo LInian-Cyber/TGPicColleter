@@ -10,10 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, types
 
 from .logger import get_logger
-from .models import PreviewRequest, ScanRequest, TelegramCredentials
+from .models import (
+    PreviewRequest,
+    ScanRequest,
+    TelegramCredentials,
+    normalize_channel_reference,
+)
 
 try:
     from .crypto import decrypt_session, encrypt_session
@@ -25,22 +30,48 @@ except ImportError:
     def encrypt_session(path: Path, use_encryption: bool = True) -> bool:
         return False
 
+try:
+    from .tg_extractor import run_advanced_telethon_task as _run_advanced
+
+    _HAS_EXTRACTOR = True
+except ImportError:
+    _HAS_EXTRACTOR = False
+
 
 def safe_name(value: str, fallback: str = "untitled", max_length: int = 90) -> str:
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
     return value[:max_length] or fallback
 
 
+def is_webpage_preview(message: Any) -> bool:
+    """Return True for Telegram-generated link preview media."""
+    media = getattr(message, "media", None)
+    return bool(media and getattr(media, "webpage", None) is not None)
+
+
+def real_media_kind(message: Any) -> str | None:
+    """Identify only media actually uploaded to the Telegram message."""
+    media = getattr(message, "media", None)
+    if isinstance(media, types.MessageMediaPhoto) and getattr(media, "photo", None):
+        return "photo"
+    if isinstance(media, types.MessageMediaDocument) and getattr(media, "document", None):
+        return "document"
+    return None
+
+
 def is_image_message(message: Any) -> bool:
     """检查消息是否为图片（排除贴纸）"""
-    if getattr(message, "photo", None):
+    media_kind = real_media_kind(message)
+    if media_kind is None:
+        return False
+    if media_kind == "photo":
         return True
     document = getattr(message, "document", None)
     if not document:
         return False
-    
+
     mime_type = getattr(document, "mime_type", "") if document else ""
-    
+
     # 排除贴纸 (webp 动画贴纸)
     attributes = getattr(document, "attributes", [])
     for attr in attributes:
@@ -50,16 +81,34 @@ def is_image_message(message: Any) -> bool:
         # 检查是否为动画贴纸
         if type(attr).__name__ == "DocumentAttributeAnimated":
             return False
-    
+
     return mime_type.startswith("image/")
 
 
 def is_downloadable_message(message: Any) -> bool:
-    return bool(
-        getattr(message, "photo", None)
-        or getattr(message, "document", None)
-        or getattr(message, "media", None)
+    return real_media_kind(message) is not None
+
+
+async def resolve_channel_entity(
+    client: TelegramClient, value: str
+) -> tuple[str, Any]:
+    """Resolve a channel reference, refreshing dialogs for uncached private channels."""
+    channel_ref = normalize_channel_reference(value)
+    entity_ref: str | int = (
+        int(channel_ref) if channel_ref.lstrip("-").isdigit() else channel_ref
     )
+    try:
+        return channel_ref, await client.get_entity(entity_ref)
+    except ValueError as exc:
+        if not (isinstance(entity_ref, int) and channel_ref.startswith("-100")):
+            raise
+        await client.get_dialogs()
+        try:
+            return channel_ref, await client.get_entity(entity_ref)
+        except ValueError as retry_exc:
+            raise ValueError(
+                "无法访问该私密频道，请确认当前登录账号已加入，并在 Telegram 中打开过该频道。"
+            ) from retry_exc
 
 
 class TelegramWorker(QThread):
@@ -73,13 +122,15 @@ class TelegramWorker(QThread):
     connection_failed = Signal(str)
     logged_out = Signal()
     scan_started = Signal()
+    scan_plan_ready = Signal(int, int)  # matched posts, downloadable files
+    scan_discovery_finished = Signal(int, int)  # matched posts, discovered files
     scan_progress = Signal(int, int, str)
     post_status_changed = Signal(int, str)
     scan_finished = Signal(int, int, int)
     scan_failed = Signal(str)
     preview_started = Signal()
     preview_progress = Signal(str)
-    preview_finished = Signal(list)
+    preview_finished = Signal(list, int, int)  # displayed rows, total matches, display limit
     preview_failed = Signal(str)
     user_profile_updated = Signal(str, str, bytes)  # name, phone, avatar_bytes
     channel_info_fetched = Signal(str, str, bytes)  # channel_id, channel_name, avatar_bytes
@@ -91,13 +142,19 @@ class TelegramWorker(QThread):
         self.use_encryption = use_encryption
         self.commands: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.cancel_event = threading.Event()
+        self.pause_event = threading.Event()   # set = 正在运行，clear = 暂停中
+        self.pause_event.set()                  # 默认运行状态
         self.preview_cancel_event = threading.Event()
         self.qr_cancel_event = threading.Event()
         self.logger = get_logger()
         self._phone_code_hash: str | None = None
         self._phone = credentials.phone
-        # 搜索预览缓存：{(channel, tag): results}
+        # 搜索预览缓存：UI 摘要之外还保留帖子和媒体消息，下载时无需再次扫描。
         self._preview_cache: dict[tuple[str, str], list[dict]] = {}
+        # 仅完整扫描过对应数量的预览缓存，才允许正式下载复用。
+        self._preview_cache_limits: dict[tuple[str, str], int] = {}
+        self._preview_cache_totals: dict[tuple[str, str], int] = {}
+        self._preview_cache_requests: dict[tuple[str, str], tuple[int, int]] = {}
 
     def load_dialogs(self) -> None:
         """加载用户的对话列表（频道、群组等）"""
@@ -125,6 +182,15 @@ class TelegramWorker(QThread):
 
     def cancel_scan(self) -> None:
         self.cancel_event.set()
+        self.pause_event.set()  # 取消时确保解除暂停，避免协程永远挂起
+
+    def pause_scan(self) -> None:
+        """暂停当前下载（_scan 会在每个 post 前检查）"""
+        self.pause_event.clear()
+
+    def resume_scan(self) -> None:
+        """继续被暂停的下载"""
+        self.pause_event.set()
 
     def start_preview(self, request: PreviewRequest) -> None:
         self.preview_cancel_event.clear()
@@ -285,7 +351,7 @@ class TelegramWorker(QThread):
         phone = f"+{me.phone}" if getattr(me, "phone", None) else self._phone
         self.authorized.emit(display_name or me.username or phone or "Telegram 用户", phone or "")
         self.status_changed.emit("会话有效")
-        
+
         # 获取用户头像
         try:
             avatar_bytes = await asyncio.wait_for(
@@ -313,7 +379,7 @@ class TelegramWorker(QThread):
             dialogs = []
             async for dialog in client.iter_dialogs(limit=100):
                 entity = dialog.entity
-                
+
                 # 只选择频道和超级群组
                 if hasattr(entity, 'broadcast') and entity.broadcast:  # 频道
                     entity_type = "channel"
@@ -323,32 +389,37 @@ class TelegramWorker(QThread):
                     entity_type = "public"
                 else:
                     continue  # 跳过普通用户和私聊群组
-                
+
                 # 获取名称和ID
                 name = getattr(entity, 'title', '') or getattr(entity, 'username', '')
                 username = getattr(entity, 'username', '')
                 entity_id = getattr(entity, 'id', '')
-                
+
                 if not name:
                     continue
-                
+
                 # 构建显示ID
                 if username:
                     display_id = f"@{username}"
                 else:
                     display_id = f"-100{entity_id}" if entity_id else ""
-                
+
                 if not display_id:
                     continue
-                
+
                 dialogs.append({
                     "name": name,
                     "id": display_id,
+                    "link": f"https://t.me/{username}" if username else (
+                        f"https://t.me/c/{str(display_id)[4:]}"
+                        if str(display_id).startswith("-100")
+                        else display_id
+                    ),
                     "avatar": b"",
                     "_entity": entity,
                     "type": entity_type
                 })
-            
+
             # UI 最多展示 20 个频道。头像并发加载并设置超时，避免阻塞后续任务。
             dialogs.sort(key=lambda x: x["name"].lower())
             dialogs = dialogs[:20]
@@ -368,21 +439,65 @@ class TelegramWorker(QThread):
             await asyncio.gather(*(load_avatar(item) for item in dialogs))
             self.dialogs_loaded.emit(dialogs)
             self.status_changed.emit("会话有效")
-            
+
         except Exception:
             self.dialogs_loaded.emit([])
             self.status_changed.emit("会话有效")
 
+    async def _emit_channel_info(self, client: TelegramClient, entity: Any, fallback_ref: str) -> None:
+        """Fetch and emit channel display metadata for the local channel cache."""
+        username = str(getattr(entity, "username", "") or "").strip()
+        entity_id = getattr(entity, "id", None)
+        channel_id = (
+            f"@{username}"
+            if username
+            else f"-100{entity_id}" if entity_id is not None else fallback_ref
+        )
+        channel_name = str(
+            getattr(entity, "title", None)
+            or getattr(entity, "username", None)
+            or fallback_ref
+        ).strip()
+        avatar_bytes = b""
+        try:
+            avatar_data = await asyncio.wait_for(
+                client.download_profile_photo(entity, file=bytes),
+                timeout=5,
+            )
+            if isinstance(avatar_data, bytes):
+                avatar_bytes = avatar_data
+        except Exception:
+            pass
+        self.channel_info_fetched.emit(channel_id, channel_name, avatar_bytes)
+
     async def _scan(self, client: TelegramClient, request: ScanRequest) -> None:
         self.scan_started.emit()
+        self.pause_event.set()  # 开始新任务时确保非暂停状态
+
+        async def wait_if_paused() -> bool:
+            """如果处于暂停状态就挂起，直到继续或取消。返回 True 表示应该 continue/break。"""
+            while not self.pause_event.is_set():
+                if self.cancel_event.is_set():
+                    return True
+                await asyncio.sleep(0.3)
+            return self.cancel_event.is_set()
+
         matched_posts = 0
         downloaded = 0
         skipped = 0
         semaphore = asyncio.Semaphore(max(1, request.concurrency))
-        pending: dict[asyncio.Task[bool], tuple[int, Path]] = {}
+        download_queue: asyncio.Queue[tuple[int, Any, Path] | None] = asyncio.Queue(
+            maxsize=max(1, request.concurrency) * 3
+        )
+        download_workers: list[asyncio.Task[None]] = []
         reserved_targets: set[Path] = set()
+        advanced_seen_urls: set[str] = set()
+        advanced_seen_media: set[tuple[str, int]] = set()
         post_downloads: dict[int, int] = {}
         post_skips: dict[int, int] = {}
+        post_pending: dict[int, int] = {}
+        post_discovery_done: set[int] = set()
+        post_status_emitted: set[int] = set()
 
         def record_file(
                 post_id: int,
@@ -406,28 +521,19 @@ class TelegramWorker(QThread):
             has_replies = bool(
                 getattr(getattr(post, "replies", None), "replies", 0) or 0
             )
-            self.logger.post_scanning(post_id, has_replies)
+            self.logger.post_scanning(
+                post_id,
+                has_replies,
+                scan_links=bool(request.custom_extract_json) or request.extract_button_link,
+                scan_replies=request.include_replies,
+            )
             self.post_status_changed.emit(post_id, "正在处理")
 
-        async def collect_finished(wait_all: bool = False) -> None:
-            if not pending:
+        def emit_finished_post(post_id: int) -> None:
+            if post_id not in post_discovery_done or post_id in post_status_emitted:
                 return
-            done, _ = await asyncio.wait(
-                set(pending),
-                return_when=asyncio.ALL_COMPLETED if wait_all else asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
-                post_id, target = pending.pop(task)
-                try:
-                    success = task.result()
-                    record_file(post_id, target, success, "" if success else "下载未返回文件")
-                except Exception as exc:
-                    self.logger.error(f"下载失败 - 帖子 #{post_id}: {target} ({exc})")
-                    record_file(post_id, target, False, f"下载失败: {exc}")
-
-        async def finish_post(post_id: int) -> None:
-            # 不再等所有任务，只收割已完成的，保持并发继续跑
-            await collect_finished(wait_all=False)
+            if post_pending.get(post_id, 0) > 0:
+                return
             downloaded_count = post_downloads.get(post_id, 0)
             skipped_count = post_skips.get(post_id, 0)
             if self.cancel_event.is_set():
@@ -438,136 +544,383 @@ class TelegramWorker(QThread):
                 status = f"已完成 · 无新增文件（跳过 {skipped_count}）"
             else:
                 status = "已完成 · 未发现可下载文件"
+            post_status_emitted.add(post_id)
             self.post_status_changed.emit(post_id, status)
             self.logger.info(f"帖子 #{post_id}: {status}")
 
+        async def download_consumer() -> None:
+            while True:
+                item = await download_queue.get()
+                if item is None:
+                    download_queue.task_done()
+                    return
+                post_id, message, target = item
+                try:
+                    if self.cancel_event.is_set():
+                        continue
+                    success = await self._download_media(
+                        client,
+                        message,
+                        target,
+                        semaphore,
+                        request.file_download_interval,
+                        chunk_concurrency=request.chunk_concurrency,
+                    )
+                    record_file(post_id, target, success, "" if success else "下载未返回文件")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.logger.error(f"下载失败 - 帖子 #{post_id}: {target} ({exc})")
+                    record_file(post_id, target, False, f"下载失败: {exc}")
+                finally:
+                    post_pending[post_id] = max(0, post_pending.get(post_id, 1) - 1)
+                    download_queue.task_done()
+                    emit_finished_post(post_id)
+
+        async def enqueue_download(post_id: int, message: Any, target: Path) -> None:
+            post_pending[post_id] = post_pending.get(post_id, 0) + 1
+            try:
+                await download_queue.put((post_id, message, target))
+            except BaseException:
+                post_pending[post_id] = max(0, post_pending.get(post_id, 1) - 1)
+                raise
+
+        async def enqueue_advanced_media(
+            source_post_id: int, message: Any, save_path: str, config: dict
+        ) -> bool:
+            """Route advanced C/D resource media through the shared download queue."""
+            target_dir = Path(save_path)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            raw_filename = self._file_name(
+                message,
+                source_post_id,
+                request.filename_template,
+                request.preserve_original_name,
+            )
+            suffix = Path(raw_filename).suffix
+            stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
+            target = target_dir / f"{Path(raw_filename).stem[:stem_limit]}{suffix}"
+            if target.exists() or target in reserved_targets:
+                target = self._tagged_available_target(
+                    target,
+                    list(config.get("_source_tags", [])),
+                    reserved_targets,
+                    request.filename_limit,
+                )
+            reserved_targets.add(target)
+            await enqueue_download(source_post_id, message, target)
+            return True
+
+        async def enqueue_linked_media(
+            source_post: Any, link_text: str, url: str, target_dir: Path
+        ) -> int:
+            """Follow a t.me post link and enqueue the target post's actual media."""
+            source_post_id = int(source_post.id)
+            source_tags = self._extract_hashtags(
+                str(getattr(source_post, "message", "") or "")
+            )
+            request_tag = request.tag.strip().lstrip("#")
+            if request_tag and request_tag not in source_tags:
+                source_tags.append(request_tag)
+            match = re.search(
+                r"(?:https?://)?t\.me/(?:c/)?([^/\s?#]+)/(\d+)",
+                url,
+                re.IGNORECASE,
+            )
+            if not match:
+                self.logger.info(f"帖子 #{source_post_id}: 忽略非 Telegram 帖子链接 {url}")
+                return 0
+            self.logger.debug(
+                f"帖子 #{source_post_id}: 命中正文链接「{link_text}」 -> {url}"
+            )
+
+            peer_raw, message_id_text = match.groups()
+            peer: str | int = peer_raw
+            if peer_raw.isdigit():
+                peer = int(f"-100{peer_raw}")
+            message_id = int(message_id_text)
+
+            try:
+                linked_message = await client.get_messages(peer, ids=message_id)
+            except Exception as exc:
+                self.logger.error(
+                    f"帖子 #{source_post_id}: 无法打开原图链接 {url} ({exc})"
+                )
+                return 0
+            if not linked_message:
+                self.logger.info(f"帖子 #{source_post_id}: 原图链接目标消息不存在 {url}")
+                return 0
+
+            linked_messages = [linked_message]
+            grouped_id = getattr(linked_message, "grouped_id", None)
+            if grouped_id:
+                try:
+                    nearby = await client.get_messages(
+                        peer,
+                        ids=list(range(max(1, message_id - 10), message_id + 11)),
+                    )
+                    linked_messages = [
+                        item
+                        for item in nearby
+                        if item and getattr(item, "grouped_id", None) == grouped_id
+                    ] or linked_messages
+                except Exception as exc:
+                    self.logger.info(
+                        f"帖子 #{source_post_id}: 无法展开目标帖相册，改为下载当前媒体 ({exc})"
+                    )
+
+            queued = 0
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for media_message in linked_messages:
+                if request.only_images and not is_image_message(media_message):
+                    continue
+                if not request.only_images and not is_downloadable_message(media_message):
+                    continue
+                raw_filename = self._file_name(
+                    media_message,
+                    int(getattr(media_message, "id", message_id)),
+                    request.filename_template,
+                    request.preserve_original_name,
+                )
+                suffix = Path(raw_filename).suffix
+                stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
+                target = target_dir / f"{Path(raw_filename).stem[:stem_limit]}{suffix}"
+                if target.exists() or target in reserved_targets:
+                    target = self._tagged_available_target(
+                        target,
+                        source_tags,
+                        reserved_targets,
+                        request.filename_limit,
+                    )
+                reserved_targets.add(target)
+                await enqueue_download(source_post_id, media_message, target)
+                queued += 1
+
+            if not queued:
+                self.logger.info(
+                    f"帖子 #{source_post_id}: 链接「{link_text}」的目标帖子没有符合条件的媒体"
+                )
+            else:
+                self.logger.debug(
+                    f"帖子 #{source_post_id}: 正文链接目标媒体已加入下载队列，共 {queued} 个"
+                )
+            return queued
+
+        async def process_comment(parent_post: Any, comment: Any) -> None:
+            """Process both direct comment media and original-media links."""
+            post_id = int(parent_post.id)
+            target_dir = self._target_dir(request, channel_name, post_id)
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            if request.custom_extract_json and _HAS_EXTRACTOR:
+                adv_params = {
+                    "save_root": str(target_dir),
+                    "custom_extract_json": request.custom_extract_json,
+                    "only_images": request.only_images,
+                    "include_replies": False,
+                    "extract_button_link": True,
+                    "button_keyword": request.button_keyword,
+                    "skip_duplicates": request.skip_duplicates,
+                    "filename_limit": request.filename_limit,
+                    "_advanced_seen_urls": advanced_seen_urls,
+                    "_advanced_seen_media": advanced_seen_media,
+                    "_advanced_download_callback": (
+                        lambda media, path, cfg, pid=post_id:
+                        enqueue_advanced_media(pid, media, path, cfg)
+                    ),
+                }
+                try:
+                    advanced_count = int(
+                        await _run_advanced(client, comment, adv_params) or 0
+                    )
+                    if advanced_count:
+                        self.logger.debug(
+                            f"帖子 #{post_id}: 高级资源已入队 {advanced_count} 个"
+                        )
+                except Exception as exc:
+                    self.logger.error(
+                        f"帖子 #{post_id}: 评论 #{comment.id} 高级链接提取失败: {exc}"
+                    )
+            elif request.extract_button_link:
+                original_link = self._find_original_link(
+                    comment, request.button_keyword
+                )
+                if original_link:
+                    link_text, original_url = original_link
+                    await enqueue_linked_media(
+                        parent_post, link_text, original_url, target_dir
+                    )
+
+            if request.only_images and not is_image_message(comment):
+                return
+            if not request.only_images and not is_downloadable_message(comment):
+                return
+
+            raw_filename = self._file_name(
+                comment,
+                post_id,
+                request.filename_template,
+                request.preserve_original_name,
+            )
+            suffix = Path(raw_filename).suffix
+            stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
+            stem = Path(raw_filename).stem[:stem_limit]
+            target = target_dir / f"{stem}{suffix}"
+            if target.exists() or target in reserved_targets:
+                if request.skip_duplicates or request.duplicate_mode == "skip":
+                    record_file(post_id, target, False, "文件已存在")
+                    return
+                if request.duplicate_mode == "rename":
+                    target = self._available_target(target, reserved_targets)
+            reserved_targets.add(target)
+            await enqueue_download(post_id, comment, target)
+
+        async def finish_post(post_id: int) -> None:
+            post_discovery_done.add(post_id)
+            emit_finished_post(post_id)
+
+        download_workers = [
+            asyncio.create_task(download_consumer())
+            for _ in range(max(1, request.concurrency))
+        ]
+
         try:
             self.logger.task_started(request.channel, request.tag)
-            channel_ref = request.channel.strip()
-            entity_ref: str | int = (
-                int(channel_ref) if channel_ref.lstrip("-").isdigit() else channel_ref
-            )
-            entity = await client.get_entity(entity_ref)
+            channel_ref, entity = await resolve_channel_entity(client, request.channel)
             channel_name = safe_name(
                 getattr(entity, "title", None)
                 or getattr(entity, "username", None)
                 or "channel"
             )
-            
-            # 获取频道头像
-            channel_id = getattr(entity, "username", None) or str(getattr(entity, "id", channel_ref))
-            if not channel_id.startswith("@") and not channel_id.startswith("-"):
-                channel_id = f"@{channel_id}" if hasattr(entity, "username") else f"-{channel_id}"
-            
-            try:
-                avatar_bytes = await client.download_profile_photo(entity, file=bytes)
-                if isinstance(avatar_bytes, bytes):
-                    self.channel_info_fetched.emit(channel_id, channel_name, avatar_bytes)
-                else:
-                    self.channel_info_fetched.emit(channel_id, channel_name, b"")
-            except Exception:
-                self.channel_info_fetched.emit(channel_id, channel_name, b"")
-            
-            tag = request.tag.strip()
-            
-            # 检查是否有预览缓存
-            cache_key = (request.channel.strip(), request.tag.strip())
-            cached_posts = None
-            if cache_key in self._preview_cache:
-                self.status_changed.emit(f"使用搜索预览缓存，开始下载")
-                cached_posts = self._preview_cache[cache_key]
-                matched_posts = len(cached_posts)
-            else:
-                self.status_changed.emit(f"正在频道中搜索 {tag or '全部帖子'}")
+            await self._emit_channel_info(client, entity, channel_ref)
 
-            # 如果有缓存，使用缓存的帖子ID列表
-            if cached_posts:
+            tag = request.tag.strip()
+
+            # 检查是否有预览缓存
+            cache_key = (
+                normalize_channel_reference(request.channel),
+                request.tag.strip(),
+            )
+            cached_posts: list[dict] | None = (
+                self._preview_cache.get(cache_key)
+                if request.only_images
+                and self._preview_cache_limits.get(cache_key, 0) >= request.max_posts
+                else None
+            )
+            if cached_posts is not None:
+                self.status_changed.emit("使用搜索预览缓存，直接下载已发现图片")
+                matched_posts = len(cached_posts)
+                planned_files = 0
+                if request.include_replies:
+                    planned_files += sum(
+                        len(item.get("_media_messages", [])) for item in cached_posts
+                    )
+                if request.extract_button_link and not (
+                    request.custom_extract_json and _HAS_EXTRACTOR
+                ):
+                    planned_files += sum(
+                        1
+                        for item in cached_posts
+                        if item.get("_post")
+                        and self._find_original_link(item["_post"], request.button_keyword)
+                    )
+                self.scan_plan_ready.emit(matched_posts, planned_files)
+            else:
+                self.status_changed.emit(
+                    f"从最新帖子开始搜索 {tag or '全部帖子'}，"
+                    f"最多检查 {request.max_posts} 篇"
+                )
+
+            # 如果有缓存，直接使用预览时保存的帖子和媒体消息。
+            if cached_posts is not None:
                 for cached_post in cached_posts:
                     if self.cancel_event.is_set():
                         break
-                    
+
                     post_id = cached_post.get("post_id")
                     if not post_id:
                         continue
-                    
+
                     try:
-                        # 获取完整的帖子对象以下载媒体
-                        post = await client.get_messages(entity, ids=post_id)
+                        # 暂停检查
+                        if await wait_if_paused():
+                            break
+                        post = cached_post.get("_post")
+                        if post is None:
+                            post = await client.get_messages(entity, ids=post_id)
                         if not post:
                             continue
-                        
+
                         begin_post(post)
-                        self.status_changed.emit(f"正在下载帖子 #{post.id} 的评论区图片")
-                        
-                        # 提取按钮链接
-                        if request.extract_button_link:
-                            button_link = self._find_button_url(post, request.button_keyword)
-                            if button_link:
-                                button_text, original_url = button_link
-                                target_dir = self._target_dir(request, channel_name, post.id)
-                                target_dir.mkdir(parents=True, exist_ok=True)
-                                target = target_dir / (
-                                    f"post_{post.id}_{safe_name(button_text, '原图链接')}.url"
+                        self.status_changed.emit(f"正在检查帖子 #{post.id} 的正文链接与媒体")
+
+                        # ── 高级套娃提取路径 ──────────────────────────────
+                        if request.custom_extract_json and _HAS_EXTRACTOR:
+                            self.status_changed.emit(f"[高级模式] 正在深挖帖子 #{post.id}…")
+                            target_dir = self._target_dir(request, channel_name, post.id)
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            adv_params = {
+                                "save_root": str(target_dir),
+                                "custom_extract_json": request.custom_extract_json,
+                                "only_images": request.only_images,
+                                "include_replies": request.include_replies,
+                                "extract_button_link": True,
+                                "button_keyword": request.button_keyword,
+                                "skip_duplicates": request.skip_duplicates,
+                                "filename_limit": request.filename_limit,
+                                "_advanced_seen_urls": advanced_seen_urls,
+                                "_advanced_seen_media": advanced_seen_media,
+                                "_advanced_download_callback": (
+                                    lambda media, path, cfg, pid=int(post.id):
+                                    enqueue_advanced_media(pid, media, path, cfg)
+                                ),
+                            }
+                            try:
+                                advanced_count = int(
+                                    await _run_advanced(client, post, adv_params) or 0
                                 )
-                                if target.exists():
-                                    if request.skip_duplicates or request.duplicate_mode == "skip":
-                                        record_file(post.id, target, False, "原图链接已存在")
-                                    else:
-                                        if request.duplicate_mode == "rename":
-                                            target = self._available_target(target)
-                                        self._write_url_shortcut(target, original_url)
-                                        record_file(post.id, target, True)
-                                else:
-                                    self._write_url_shortcut(target, original_url)
-                                    record_file(post.id, target, True)
+                                if advanced_count:
+                                    self.logger.debug(
+                                        f"帖子 #{post.id}: 高级资源已入队 {advanced_count} 个"
+                                    )
+                            except Exception as _adv_exc:
+                                self.logger.error(f"高级提取失败 #{post.id}: {_adv_exc}")
+                            await finish_post(post.id)
+                            continue
+                        # 跟随帖子正文或按钮中的 Telegram 链接，下载目标帖媒体。
+                        if request.extract_button_link and not (
+                            request.custom_extract_json and _HAS_EXTRACTOR
+                        ):
+                            original_link = self._find_original_link(post, request.button_keyword)
+                            if original_link:
+                                link_text, original_url = original_link
+                                target_dir = self._target_dir(request, channel_name, post.id)
+                                await enqueue_linked_media(
+                                    post, link_text, original_url, target_dir
+                                )
+                            else:
+                                self.logger.debug(
+                                    f"帖子 #{post.id}: 正文中未找到包含"
+                                    f"「{request.button_keyword}」的 Telegram 帖子链接"
+                                )
 
                         if not request.include_replies:
                             await finish_post(post.id)
                             continue
 
                         try:
-                            comment_iter = client.iter_messages(entity, reply_to=post.id)
-                            async for comment in comment_iter:
+                            cached_comments = cached_post.get("_comments")
+                            if cached_comments is not None:
+                                comments = cached_comments
+                            else:
+                                comments = [
+                                    comment
+                                    async for comment in client.iter_messages(entity, reply_to=post.id)
+                                ]
+                            for comment in comments:
                                 if self.cancel_event.is_set():
                                     break
-                                if request.only_images and not is_image_message(comment):
-                                    continue
-                                if not request.only_images and not is_downloadable_message(comment):
-                                    continue
-
-                                target_dir = self._target_dir(request, channel_name, post.id)
-                                target_dir.mkdir(parents=True, exist_ok=True)
-                                raw_filename = self._file_name(
-                                    comment,
-                                    post.id,
-                                    request.filename_template,
-                                    request.preserve_original_name,
-                                )
-                                suffix = Path(raw_filename).suffix
-                                stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
-                                stem = Path(raw_filename).stem[:stem_limit]
-                                target = target_dir / f"{stem}{suffix}"
-                                if target.exists() or target in reserved_targets:
-                                    if request.skip_duplicates or request.duplicate_mode == "skip":
-                                        record_file(post.id, target, False, "文件已存在")
-                                        continue
-                                    if request.duplicate_mode == "rename":
-                                        target = self._available_target(target, reserved_targets)
-                                elif target in reserved_targets:
-                                    await collect_finished(wait_all=True)
-                                reserved_targets.add(target)
-                                download_task = asyncio.create_task(
-                                    self._download_media(
-                                        client,
-                                        comment,
-                                        target,
-                                        semaphore,
-                                        request.file_download_interval,
-                                    )
-                                )
-                                pending[download_task] = (int(post.id), target)
-                                if len(pending) >= max(1, request.concurrency):
-                                    await collect_finished()
+                                await process_comment(post, comment)
                         except errors.RPCError:
                             pass
                         await finish_post(post.id)
@@ -578,7 +931,10 @@ class TelegramWorker(QThread):
             else:
                 # 没有缓存，正常扫描
                 async for post in client.iter_messages(
-                        entity, search=tag or None, limit=request.max_posts
+                        entity,
+                        search=tag or None,
+                        limit=request.max_posts,
+                        reverse=False,
                 ):
                     if self.cancel_event.is_set():
                         break
@@ -587,29 +943,61 @@ class TelegramWorker(QThread):
                     if not tag and request.empty_tag_action == "skip":
                         continue
 
+                    # 暂停检查
+                    if await wait_if_paused():
+                        break
                     matched_posts += 1
                     begin_post(post)
-                    self.status_changed.emit(f"正在检查帖子 #{post.id} 的评论")
-                    if request.extract_button_link:
-                        button_link = self._find_button_url(post, request.button_keyword)
-                        if button_link:
-                            button_text, original_url = button_link
-                            target_dir = self._target_dir(request, channel_name, post.id)
-                            target_dir.mkdir(parents=True, exist_ok=True)
-                            target = target_dir / (
-                                f"post_{post.id}_{safe_name(button_text, '原图链接')}.url"
+                    self.status_changed.emit(f"正在检查帖子 #{post.id} 的正文链接与媒体")
+
+                    # ── 高级套娃提取路径 ──────────────────────────────
+                    if request.custom_extract_json and _HAS_EXTRACTOR:
+                        self.status_changed.emit(f"[高级模式] 正在深挖帖子 #{post.id}…")
+                        target_dir = self._target_dir(request, channel_name, post.id)
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        adv_params = {
+                            "save_root": str(target_dir),
+                            "custom_extract_json": request.custom_extract_json,
+                            "only_images": request.only_images,
+                            "include_replies": request.include_replies,
+                            "extract_button_link": True,
+                            "button_keyword": request.button_keyword,
+                            "skip_duplicates": request.skip_duplicates,
+                            "filename_limit": request.filename_limit,
+                            "_advanced_seen_urls": advanced_seen_urls,
+                            "_advanced_seen_media": advanced_seen_media,
+                            "_advanced_download_callback": (
+                                lambda media, path, cfg, pid=int(post.id):
+                                enqueue_advanced_media(pid, media, path, cfg)
+                            ),
+                        }
+                        try:
+                            advanced_count = int(
+                                await _run_advanced(client, post, adv_params) or 0
                             )
-                            if target.exists():
-                                if request.skip_duplicates or request.duplicate_mode == "skip":
-                                    record_file(post.id, target, False, "原图链接已存在")
-                                else:
-                                    if request.duplicate_mode == "rename":
-                                        target = self._available_target(target)
-                                    self._write_url_shortcut(target, original_url)
-                                    record_file(post.id, target, True)
-                            else:
-                                self._write_url_shortcut(target, original_url)
-                                record_file(post.id, target, True)
+                            if advanced_count:
+                                self.logger.debug(
+                                    f"帖子 #{post.id}: 高级资源已入队 {advanced_count} 个"
+                                )
+                        except Exception as _adv_exc:
+                            self.logger.error(f"高级提取失败 #{post.id}: {_adv_exc}")
+                        await finish_post(post.id)
+                        continue
+                    if request.extract_button_link and not (
+                        request.custom_extract_json and _HAS_EXTRACTOR
+                    ):
+                        original_link = self._find_original_link(post, request.button_keyword)
+                        if original_link:
+                            link_text, original_url = original_link
+                            target_dir = self._target_dir(request, channel_name, post.id)
+                            await enqueue_linked_media(
+                                post, link_text, original_url, target_dir
+                            )
+                        else:
+                            self.logger.debug(
+                                f"帖子 #{post.id}: 正文中未找到包含"
+                                f"「{request.button_keyword}」的 Telegram 帖子链接"
+                            )
 
                     if not request.include_replies:
                         await finish_post(post.id)
@@ -620,50 +1008,17 @@ class TelegramWorker(QThread):
                         async for comment in comment_iter:
                             if self.cancel_event.is_set():
                                 break
-                            if request.only_images and not is_image_message(comment):
-                                continue
-                            if not request.only_images and not is_downloadable_message(comment):
-                                continue
-
-                            target_dir = self._target_dir(request, channel_name, post.id)
-                            target_dir.mkdir(parents=True, exist_ok=True)
-                            raw_filename = self._file_name(
-                                comment,
-                                post.id,
-                                request.filename_template,
-                                request.preserve_original_name,
-                            )
-                            suffix = Path(raw_filename).suffix
-                            stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
-                            stem = Path(raw_filename).stem[:stem_limit]
-                            target = target_dir / f"{stem}{suffix}"
-                            if target.exists() or target in reserved_targets:
-                                if request.skip_duplicates or request.duplicate_mode == "skip":
-                                    record_file(post.id, target, False, "文件已存在")
-                                    continue
-                                if request.duplicate_mode == "rename":
-                                    target = self._available_target(target, reserved_targets)
-                            elif target in reserved_targets:
-                                await collect_finished(wait_all=True)
-                            reserved_targets.add(target)
-                            download_task = asyncio.create_task(
-                                self._download_media(
-                                    client,
-                                    comment,
-                                    target,
-                                    semaphore,
-                                    request.file_download_interval,
-                                )
-                            )
-                            pending[download_task] = (int(post.id), target)
-                            if len(pending) >= max(1, request.concurrency):
-                                await collect_finished()
+                            await process_comment(post, comment)
                     except errors.RPCError:
                         # 该帖子没有评论区或评论区不可访问，跳过继续处理下一条帖子
                         pass
                     await finish_post(post.id)
 
-            await collect_finished(wait_all=True)
+            if not self.cancel_event.is_set():
+                discovered_files = downloaded + skipped + sum(post_pending.values())
+                self.scan_discovery_finished.emit(matched_posts, discovered_files)
+
+            await download_queue.join()
 
             self.logger.task_completed(
                 matched_posts, downloaded, skipped, self.cancel_event.is_set()
@@ -677,29 +1032,40 @@ class TelegramWorker(QThread):
             self.logger.error(f"任务失败: {exc}")
             self.scan_failed.emit(str(exc))
         finally:
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            for _ in download_workers:
+                await download_queue.put(None)
+            if download_workers:
+                await asyncio.gather(*download_workers, return_exceptions=True)
 
     async def _preview(self, client: TelegramClient, request: PreviewRequest) -> None:
         self.preview_started.emit()
-        
+
         # 检查缓存
-        cache_key = (request.channel.strip(), request.tag.strip())
-        if cache_key in self._preview_cache:
+        cache_key = (
+            normalize_channel_reference(request.channel),
+            request.tag.strip(),
+        )
+        request_signature = (request.max_posts, request.max_results)
+        if (
+            cache_key in self._preview_cache
+            and self._preview_cache_requests.get(cache_key) == request_signature
+        ):
             self.preview_progress.emit("正在从缓存加载…")
             await asyncio.sleep(0.3)  # 短暂延迟以显示消息
-            self.preview_finished.emit(self._preview_cache[cache_key])
-            return
-        
-        results: list[dict[str, Any]] = []
-        try:
-            channel_ref = request.channel.strip()
-            entity_ref: str | int = (
-                int(channel_ref) if channel_ref.lstrip("-").isdigit() else channel_ref
+            rows = self._preview_cache[cache_key]
+            self.preview_finished.emit(
+                self._public_preview_rows(rows),
+                self._preview_cache_totals.get(cache_key, len(rows)),
+                request.max_results,
             )
-            entity = await client.get_entity(entity_ref)
+            return
+
+        results: list[dict[str, Any]] = []
+        total_count = 0
+        preview_complete = True
+        try:
+            channel_ref, entity = await resolve_channel_entity(client, request.channel)
+            await self._emit_channel_info(client, entity, channel_ref)
             channel_name = (
                     getattr(entity, "title", None)
                     or getattr(entity, "username", None)
@@ -709,24 +1075,40 @@ class TelegramWorker(QThread):
             self.preview_progress.emit(f"正在搜索 {channel_name} 中的 {tag or '全部帖子'}…")
 
             async for post in client.iter_messages(
-                    entity, search=tag or None, limit=request.max_posts
+                    entity,
+                    search=tag or None,
+                    limit=request.max_posts,
+                    reverse=False,
             ):
-                if self.preview_cancel_event.is_set() or len(results) >= request.max_results:
+                if self.preview_cancel_event.is_set():
+                    preview_complete = False
                     break
                 text = (post.message or "").strip()
                 if tag and tag.casefold() not in text.casefold():
                     continue
+                total_count += 1
+                if len(results) >= request.max_results:
+                    if total_count % 25 == 0:
+                        self.preview_progress.emit(
+                            f"已找到 {total_count} 篇匹配帖子，继续统计总数…"
+                        )
+                    continue
 
                 image_count = 0
                 thumbnails: list[bytes] = []
+                comments: list[Any] = []
+                media_messages: list[Any] = []
                 self.preview_progress.emit(f"正在检查帖子 #{post.id} 的评论图片…")
                 try:
                     async for comment in client.iter_messages(entity, reply_to=post.id):
                         if self.preview_cancel_event.is_set():
+                            preview_complete = False
                             break
+                        comments.append(comment)
                         if not is_image_message(comment):
                             continue
                         image_count += 1
+                        media_messages.append(comment)
                         if len(thumbnails) < request.thumbnails_per_post:
                             thumbnail = await self._thumbnail_bytes(client, comment)
                             if thumbnail:
@@ -749,19 +1131,43 @@ class TelegramWorker(QThread):
                         ),
                         "image_count": image_count,
                         "thumbnails": thumbnails,
+                        "_post": post,
+                        "_comments": comments,
+                        "_media_messages": media_messages,
                     }
                 )
 
             # 保存到缓存
             self._preview_cache[cache_key] = results
-            self.preview_finished.emit(results)
+            self._preview_cache_totals[cache_key] = total_count
+            self._preview_cache_requests[cache_key] = request_signature
+            self._preview_cache_limits[cache_key] = (
+                request.max_posts
+                if preview_complete and total_count <= request.max_results
+                else 0
+            )
+            self.preview_finished.emit(
+                self._public_preview_rows(results),
+                total_count,
+                request.max_results,
+            )
         except errors.FloodWaitError as exc:
             self.preview_failed.emit(f"Telegram 要求等待 {exc.seconds} 秒后重试")
         except Exception as exc:
             self.preview_failed.emit(str(exc))
 
     @staticmethod
+    def _public_preview_rows(rows: list[dict]) -> list[dict]:
+        """Remove worker-only Telegram objects before sending preview data to the UI."""
+        return [
+            {key: value for key, value in row.items() if not key.startswith("_")}
+            for row in rows
+        ]
+
+    @staticmethod
     async def _thumbnail_bytes(client: TelegramClient, message: Any) -> bytes | None:
+        if is_webpage_preview(message):
+            return None
         document = getattr(message, "document", None)
         has_thumbnail = bool(getattr(message, "photo", None)) or bool(
             getattr(document, "thumbs", None)
@@ -781,33 +1187,121 @@ class TelegramWorker(QThread):
             target: Path,
             semaphore: asyncio.Semaphore,
             file_download_interval: float,
+            chunk_concurrency: int = 1,
     ) -> bool:
+        """
+        下载单个媒体文件。
+
+        chunk_concurrency == 1（默认）：走 Telethon 原生单线程流式下载。
+        chunk_concurrency >= 2：启用分片并发下载。
+          原理：先获取文件总大小，将其等分为 N 块，N 个协程同时用
+          iter_download(offset, limit) 拉取对应字节段，全部完成后
+          按顺序写入磁盘，速度可提升 2-4x（受服务器限速影响）。
+        """
+        if real_media_kind(message) is None:
+            return False
+
+        async def download() -> bool:
+            if chunk_concurrency <= 1:
+                result = await client.download_media(message, file=str(target))
+                return bool(result)
+
+            media = getattr(message, "media", None)
+            document = getattr(media, "document", None) or getattr(media, "photo", None)
+            file_size: int = getattr(document, "size", 0) if document else 0
+
+            MIN_CHUNK_SIZE = 512 * 1024  # 512 KB，低于这个没必要分片
+            if file_size < MIN_CHUNK_SIZE * chunk_concurrency:
+                result = await client.download_media(message, file=str(target))
+                return bool(result)
+
+            chunk_size = (file_size + chunk_concurrency - 1) // chunk_concurrency
+            ALIGN = 4096
+            chunk_size = ((chunk_size + ALIGN - 1) // ALIGN) * ALIGN
+
+            ranges: list[tuple[int, int]] = []
+            offset = 0
+            while offset < file_size:
+                end = min(offset + chunk_size, file_size)
+                ranges.append((offset, end - offset))
+                offset = end
+
+            async def fetch_chunk(off: int, lim: int) -> bytes:
+                buf = bytearray()
+                async for block in client.iter_download(message, offset=off, limit=lim):
+                    buf.extend(block)
+                return bytes(buf)
+
+            chunks: list[bytes | BaseException] = await asyncio.gather(
+                *(fetch_chunk(off, lim) for off, lim in ranges),
+                return_exceptions=True,
+            )
+
+            if any(isinstance(c, BaseException) for c in chunks):
+                result = await client.download_media(message, file=str(target))
+                return bool(result)
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as fh:
+                for chunk in chunks:
+                    fh.write(chunk)  # type: ignore[arg-type]
+            return target.exists() and target.stat().st_size > 0
+
         async with semaphore:
-            result = await client.download_media(message, file=str(target))
-            if file_download_interval > 0:
-                await asyncio.sleep(file_download_interval)
-            return bool(result)
+            success = await download()
+        # 冷却不占用下载并发槽，其他文件可以继续传输。
+        if file_download_interval > 0:
+            await asyncio.sleep(file_download_interval)
+        return success
 
     @staticmethod
-    def _find_button_url(message: Any, keyword: str) -> tuple[str, str] | None:
+    def _find_original_link(message: Any, keyword: str) -> tuple[str, str] | None:
+        """Find a matching Telegram post URL in the post body's rich-text links."""
         keyword_folded = keyword.strip().casefold()
         if not keyword_folded:
             return None
-        for row in getattr(message, "buttons", None) or []:
-            for button in row:
-                text = str(getattr(button, "text", "") or "").strip()
-                url = str(getattr(button, "url", "") or "").strip()
-                if keyword_folded in text.casefold() and url:
-                    return text, url
-        return None
 
-    @staticmethod
-    def _write_url_shortcut(target: Path, url: str) -> None:
-        clean_url = url.replace("\r", "").replace("\n", "").strip()
-        target.write_text(
-            f"[InternetShortcut]\nURL={clean_url}\n",
-            encoding="utf-8",
-        )
+        raw_text = str(getattr(message, "message", "") or "")
+        candidates: list[tuple[str, str]] = []
+        try:
+            entities_text = message.get_entities_text()
+        except (AttributeError, TypeError, ValueError):
+            entities_text = []
+        for entity, visible_text in entities_text:
+            text = str(visible_text or "").strip()
+            url = str(getattr(entity, "url", "") or "").strip()
+            if not url and type(entity).__name__ == "MessageEntityUrl":
+                url = text
+            if re.search(r"(?:https?://)?t\.me/(?:c/)?[^/\s?#]+/\d+", url):
+                if keyword_folded in text.casefold():
+                    return text, url
+                candidates.append((text, url))
+
+        # Also support messages where Markdown-like source text was posted literally.
+        for text, url in re.findall(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", raw_text):
+            if (
+                keyword_folded in text.casefold()
+                and re.search(r"(?:https?://)?t\.me/(?:c/)?[^/\s?#]+/\d+", url)
+            ):
+                return text.strip(), url.strip()
+
+        for url in re.findall(
+            r"(?:https?://)?t\.me/(?:c/)?[^/\s?#)]+/\d+",
+            raw_text,
+            flags=re.IGNORECASE,
+        ):
+            candidates.append((url, url))
+
+        # Some Telegram posts store the label and URL as separate entities. If the
+        # body contains the keyword, use the first unique Telegram post link.
+        if keyword_folded in raw_text.casefold():
+            seen: set[str] = set()
+            for text, url in candidates:
+                if url in seen:
+                    continue
+                seen.add(url)
+                return text, url
+        return None
 
     @staticmethod
     def _target_dir(request: ScanRequest, channel_name: str, post_id: int) -> Path:
@@ -871,3 +1365,39 @@ class TelegramWorker(QThread):
             candidate = target.with_name(f"{target.stem}_{index}{target.suffix}")
             index += 1
         return candidate
+
+    @staticmethod
+    def _extract_hashtags(text: str) -> list[str]:
+        tags: list[str] = []
+        for tag in re.findall(r"(?<![\w#])#([\w]+)", text, flags=re.UNICODE):
+            cleaned = safe_name(tag, "", 60)
+            if cleaned and cleaned not in tags:
+                tags.append(cleaned)
+        return tags
+
+    @classmethod
+    def _tagged_available_target(
+        cls,
+        target: Path,
+        tags: list[str],
+        reserved: set[Path] | None = None,
+        filename_limit: int = 100,
+    ) -> Path:
+        occupied = reserved or set()
+        suffix = target.suffix
+        max_stem_length = max(1, min(filename_limit, 255 - len(suffix)))
+        for tag in tags:
+            tag_limit = max(1, max_stem_length - 2)
+            prefix = f"{safe_name(tag, '', tag_limit)}_"
+            stem_limit = max(1, max_stem_length - len(prefix))
+            candidate = target.with_name(f"{prefix}{target.stem[:stem_limit]}{suffix}")
+            if not candidate.exists() and candidate not in occupied:
+                return candidate
+        index = 2
+        while True:
+            tail = f"_{index}"
+            stem_limit = max(1, max_stem_length - len(tail))
+            candidate = target.with_name(f"{target.stem[:stem_limit]}{tail}{suffix}")
+            if not candidate.exists() and candidate not in occupied:
+                return candidate
+            index += 1

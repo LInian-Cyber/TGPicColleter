@@ -72,9 +72,22 @@ class DownloadLogger:
         self.info(f"{result} - 匹配帖子: {posts}, 下载: {downloaded}, 跳过: {skipped}")
         self.info(f"===== 任务结束 =====\n")
     
-    def post_scanning(self, post_id: int, has_replies: bool):
+    def post_scanning(
+        self,
+        post_id: int,
+        has_replies: bool,
+        scan_links: bool = False,
+        scan_replies: bool = False,
+    ):
         """记录帖子扫描"""
-        self.debug(f"扫描帖子 #{post_id} (有评论: {has_replies})")
+        link_state = "开启" if scan_links else "关闭"
+        if not scan_replies:
+            reply_state = "未启用"
+        else:
+            reply_state = "可扫描" if has_replies else "无评论"
+        self.debug(
+            f"扫描帖子 #{post_id} (正文链接追踪: {link_state}, 评论区扫描: {reply_state})"
+        )
     
     def file_downloaded(self, post_id: int, filename: str):
         """记录文件下载"""

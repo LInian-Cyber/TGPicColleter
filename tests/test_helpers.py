@@ -81,11 +81,11 @@ class TelegramWorkerHelperTests(TestCase):
 
         self.assertEqual(result, ("高清 Source", "https://example.com/original"))
 
-    def test_url_shortcut_is_written(self) -> None:
+    def test_link_shortcut_is_written(self) -> None:
         with TemporaryDirectory() as directory:
             target = Path(directory) / "original.url"
 
-            TelegramWorker._write_url_shortcut(target, "https://example.com/image.jpg")
+            TelegramWorker._write_link_shortcut(target, "https://example.com/image.jpg")
 
             self.assertEqual(
                 target.read_text(encoding="utf-8"),
@@ -167,6 +167,46 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
         client.download_media.assert_awaited_once()
         sleep.assert_awaited_once_with(0.5)
 
+    async def test_file_cooldown_does_not_hold_download_slot(self) -> None:
+        cooldown_started = asyncio.Event()
+        release_cooldown = asyncio.Event()
+        second_download_started = asyncio.Event()
+        download_calls = 0
+
+        async def download_media(_message, file):
+            nonlocal download_calls
+            download_calls += 1
+            if download_calls == 2:
+                second_download_started.set()
+            return file
+
+        async def wait_for_cooldown(_delay):
+            cooldown_started.set()
+            await release_cooldown.wait()
+
+        client = SimpleNamespace(download_media=download_media)
+        semaphore = asyncio.Semaphore(1)
+        with patch(
+            "tg_pic_collector.telegram_worker.asyncio.sleep",
+            new=wait_for_cooldown,
+        ):
+            first = asyncio.create_task(
+                TelegramWorker._download_media(
+                    client, SimpleNamespace(id=1), Path("one.jpg"), semaphore, 0.5
+                )
+            )
+            await cooldown_started.wait()
+            second = asyncio.create_task(
+                TelegramWorker._download_media(
+                    client, SimpleNamespace(id=2), Path("two.jpg"), semaphore, 0.5
+                )
+            )
+            await asyncio.wait_for(second_download_started.wait(), timeout=0.5)
+            release_cooldown.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(download_calls, 2)
+
     async def test_preview_returns_post_summary_and_image_count(self) -> None:
         post = SimpleNamespace(
             id=42,
@@ -199,7 +239,13 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
             TelegramCredentials(1, "hash", "", Path("test-session"))
         )
         rows = []
-        worker.preview_finished.connect(rows.extend)
+        preview_counts = []
+        worker.preview_finished.connect(
+            lambda preview_rows, total, limit: (
+                rows.extend(preview_rows),
+                preview_counts.append((total, limit)),
+            )
+        )
 
         await worker._preview(
             FakeClient(),
@@ -210,6 +256,80 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["post_id"], 42)
         self.assertEqual(rows[0]["image_count"], 1)
         self.assertEqual(rows[0]["thumbnails"], [b"thumbnail"])
+        self.assertEqual(preview_counts, [(1, 50)])
+        cached = worker._preview_cache[("@demo", "#cats")][0]
+        self.assertIs(cached["_post"], post)
+        self.assertEqual(cached["_media_messages"], [image])
+        self.assertNotIn("_post", rows[0])
+        self.assertNotIn("_media_messages", rows[0])
+
+    async def test_scan_uses_preview_media_cache_without_rescanning_comments(self) -> None:
+        post = SimpleNamespace(
+            id=42,
+            message="#cats",
+            replies=SimpleNamespace(replies=1),
+            buttons=None,
+        )
+        image = SimpleNamespace(
+            id=99,
+            photo=object(),
+            document=None,
+            file=SimpleNamespace(name="photo.jpg", mime_type="image/jpeg"),
+            date=None,
+        )
+
+        class FakeClient:
+            async def get_entity(self, _):
+                return SimpleNamespace(title="Demo Channel", username="demo", id=1)
+
+            async def download_profile_photo(self, *_args, **_kwargs):
+                return b""
+
+            def iter_messages(self, *_args, **_kwargs):
+                raise AssertionError("cached scan must not iterate messages")
+
+            async def get_messages(self, *_args, **_kwargs):
+                raise AssertionError("cached scan must not refetch the post")
+
+            async def download_media(self, _message, file):
+                return file
+
+        with TemporaryDirectory() as directory:
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", Path(directory) / "session")
+            )
+            worker._preview_cache[("@demo", "#cats")] = [
+                {
+                    "post_id": 42,
+                    "image_count": 1,
+                    "_post": post,
+                    "_media_messages": [image],
+                }
+            ]
+            worker._preview_cache_limits[("@demo", "#cats")] = 10
+            plans = []
+            progress = []
+            worker.scan_plan_ready.connect(lambda posts, total: plans.append((posts, total)))
+            worker.scan_progress.connect(
+                lambda downloaded, skipped, location: progress.append(
+                    (downloaded, skipped, location)
+                )
+            )
+
+            await worker._scan(
+                FakeClient(),
+                ScanRequest(
+                    "@demo",
+                    "#cats",
+                    Path(directory),
+                    "tag",
+                    max_posts=10,
+                    file_download_interval=0,
+                ),
+            )
+
+        self.assertEqual(plans, [(1, 1)])
+        self.assertEqual(progress[-1][:2], (1, 0))
 
 
 class AppConfigTests(TestCase):

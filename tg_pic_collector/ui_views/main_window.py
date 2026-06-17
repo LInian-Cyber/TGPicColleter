@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QEvent, QPoint
+from PySide6.QtGui import QCursor
+from qfluentwidgets import MenuAnimationType
+
+from .. import __version__
+from ..i18n import apply_language as apply_widget_language, translate
 from .common import *
 from .common import _UI_DIR
 from .about import AboutPage
@@ -32,6 +38,10 @@ class MainWindow(FluentWindow):
     task_preview_cancel_requested = Signal()
     task_pause_all_requested = Signal()
     task_clear_queue_requested = Signal()
+    tray_pause_requested = Signal()
+    tray_resume_requested = Signal()
+    tray_stop_requested = Signal()
+    tray_quit_requested = Signal()
     # 登录
     send_code_requested = Signal(str)
     login_requested = Signal(str, str, str)
@@ -46,6 +56,7 @@ class MainWindow(FluentWindow):
     open_log_requested = Signal()
     open_log_folder_requested = Signal()
     history_clear_requested = Signal()
+    history_delete_requested = Signal(int)
     trend_period_changed = Signal(str)
     # 窗口关闭
     window_closing = Signal()
@@ -61,6 +72,22 @@ class MainWindow(FluentWindow):
         self.settings_page = SettingsPage()
         self.about_page = AboutPage()
         self._preview_dialog: SearchPreviewDialog | None = None
+        self._closing = False
+        self._tray_icon: QSystemTrayIcon | None = None
+        self._tray_menu: RoundMenu | None = None
+        self._tray_pause_action: Action | None = None
+        self._tray_resume_action: Action | None = None
+        self._tray_stop_action: Action | None = None
+        self._system_notifications_enabled = True
+        self._initially_centered = False
+        self._language = "zh_CN"
+        self._sidebar_width = 280
+        self._sidebar_min_width = 220
+        self._sidebar_max_width = 420
+        self._sidebar_dragging = False
+        self._sidebar_drag_start_x = 0
+        self._sidebar_drag_start_width = self._sidebar_width
+        self._sidebar_resize_grip: QFrame | None = None
 
         # 注册导航
         self.addSubInterface(self.home_page,     FIF.HOME,     "首页")
@@ -84,7 +111,7 @@ class MainWindow(FluentWindow):
         self.navigationInterface.addItem(
             routeKey="versionItem",
             icon=FIF.ACCEPT,
-            text="v2.3.0",
+            text=f"v{__version__}",
             onClick=lambda: self.switchTo(self.about_page),
             position=NavigationItemPosition.BOTTOM
         )
@@ -93,14 +120,26 @@ class MainWindow(FluentWindow):
         icon_path = _UI_DIR / "telegram-app-icon.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = QSystemTrayIcon(self.windowIcon(), self)
+            self._tray_icon.setToolTip("TG Pic Collector")
+            self._tray_icon.activated.connect(self._on_tray_activated)
+            self._tray_icon.messageClicked.connect(self._restore_from_notification)
+            self._build_tray_menu()
+            self._tray_icon.show()
         self.setWindowTitle("Telegram 评论区图片下载器")
         self.resize(1440, 900)
         self.setMinimumSize(1200, 760)
-        self.navigationInterface.setExpandWidth(280)
+        self.navigationInterface.setExpandWidth(self._sidebar_width)
         self.navigationInterface.setMinimumExpandWidth(1080)
         self.navigationInterface.expand(useAni=False)
+        self._build_sidebar_resize_grip()
 
         self._wire_internal()
+        apply_tooltip_theme()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _wire_internal(self):
         """连接子页面 Signal → 顶级 Signal 或页面切换（纯 UI 内部路由）"""
@@ -125,18 +164,20 @@ class MainWindow(FluentWindow):
         self.login_page.qr_requested.connect(self.qr_requested)
         self.login_page.logout_requested.connect(self.logout_requested)
         # 历史页
-        self.history_page.clear_requested.connect(self.history_clear_requested)
-        self.history_page.open_folder_requested.connect(self.open_folder_requested)
-        self.history_page.pause_task_requested.connect(self.task_pause_requested)
-        self.history_page.delete_task_requested.connect(self.task_delete_requested)
-        self.history_page.pause_all_requested.connect(self.task_pause_all_requested)
-        self.history_page.clear_queue_requested.connect(self.task_clear_queue_requested)
-        self.history_page.open_log_requested.connect(self.open_log_requested)
-        self.history_page.open_log_folder_requested.connect(self.open_log_folder_requested)
+        self.history_page.clear_requested.connect(self.history_clear_requested.emit)
+        self.history_page.delete_history_requested.connect(self.history_delete_requested.emit)
+        self.history_page.open_folder_requested.connect(self.open_folder_requested.emit)
+        self.history_page.pause_task_requested.connect(self.task_pause_requested.emit)
+        self.history_page.delete_task_requested.connect(self.task_delete_requested.emit)
+        self.history_page.pause_all_requested.connect(self.task_pause_all_requested.emit)
+        self.history_page.clear_queue_requested.connect(self.task_clear_queue_requested.emit)
+        self.history_page.open_log_requested.connect(self.open_log_requested.emit)
+        self.history_page.open_log_folder_requested.connect(self.open_log_folder_requested.emit)
         # 设置页
         self.settings_page.save_requested.connect(self.settings_save_requested)
         self.settings_page.logout_requested.connect(self.settings_logout_requested)
         self.settings_page.cache_clear_requested.connect(self.settings_cache_clear_requested)
+        self.settings_page.language_preview_requested.connect(self.apply_language)
 
     # ──────────────────────────────────────────────────────────
     #  公开 Setter API（Controller 调用这些方法推数据入 UI）
@@ -184,12 +225,18 @@ class MainWindow(FluentWindow):
         preserve_original_name: bool,
         duplicate_mode: str,
         open_after_download: bool,
+        concurrency: int,
+        file_download_interval: float,
+        filename_limit: int,
     ):
         self.task_page.set_rule_summary(
             filename_template,
             preserve_original_name,
             duplicate_mode,
             open_after_download,
+            concurrency,
+            file_download_interval,
+            filename_limit,
         )
 
     def set_task_busy(self, busy: bool):
@@ -213,10 +260,12 @@ class MainWindow(FluentWindow):
         if self._preview_dialog:
             self._preview_dialog.set_progress(message)
 
-    def set_search_preview_results(self, rows: list[dict]):
+    def set_search_preview_results(
+        self, rows: list[dict], total_count: int, display_limit: int
+    ):
         self.task_page.set_preview_busy(False)
         if self._preview_dialog:
-            self._preview_dialog.set_results(rows)
+            self._preview_dialog.set_results(rows, total_count, display_limit)
 
     def set_search_preview_error(self, message: str):
         self.task_page.set_preview_busy(False)
@@ -249,21 +298,55 @@ class MainWindow(FluentWindow):
 
     def show_success(self, message: str):
         InfoBar.success(
-            title="操作成功", content=message, parent=self,
+            title=translate("操作成功", self._language),
+            content=translate(message, self._language),
+            parent=self,
             position=InfoBarPosition.TOP_RIGHT, duration=3500,
         )
 
     def show_error(self, message: str):
         InfoBar.error(
-            title="需要处理一下", content=message, parent=self,
+            title=translate("需要处理一下", self._language),
+            content=translate(message, self._language),
+            parent=self,
             position=InfoBarPosition.TOP_RIGHT, duration=5500,
         )
 
     def show_info(self, message: str):
         InfoBar.info(
-            title="提示", content=message, parent=self,
+            title=translate("提示", self._language),
+            content=translate(message, self._language),
+            parent=self,
             position=InfoBarPosition.TOP_RIGHT, duration=3000,
         )
+
+    def show_system_notification(self, title: str, message: str):
+        """Show a native operating-system notification when available."""
+        if self._tray_icon and self._system_notifications_enabled:
+            self._tray_icon.showMessage(
+                translate(title, self._language),
+                translate(message, self._language),
+                QSystemTrayIcon.MessageIcon.Information,
+                7000,
+            )
+
+    def set_system_notifications_enabled(self, enabled: bool):
+        self._system_notifications_enabled = enabled
+        if self._tray_icon and not self._tray_icon.isVisible():
+            self._tray_icon.show()
+
+    def set_tray_task_state(
+        self,
+        can_pause: bool = False,
+        can_resume: bool = False,
+        can_stop: bool = False,
+    ):
+        if self._tray_pause_action:
+            self._tray_pause_action.setEnabled(can_pause)
+        if self._tray_resume_action:
+            self._tray_resume_action.setEnabled(can_resume)
+        if self._tray_stop_action:
+            self._tray_stop_action.setEnabled(can_stop)
 
     def navigate_to_login(self):
         self.switchTo(self.login_page)
@@ -284,11 +367,216 @@ class MainWindow(FluentWindow):
         current = self.settings_page._theme_radios
         if current.get("dark") and current["dark"].isChecked():
             current["light"].setChecked(True)
-            setTheme(Theme.LIGHT)
+            setTheme(Theme.LIGHT, lazy=True)
         else:
             current.get("dark") and current["dark"].setChecked(True)
-            setTheme(Theme.DARK)
+            setTheme(Theme.DARK, lazy=True)
+        apply_tooltip_theme()
+
+    def apply_language(self, lang: str):
+        self._language = lang
+        apply_widget_language(self, lang)
+
+    def eventFilter(self, watched, event):
+        sidebar_grip = getattr(self, "_sidebar_resize_grip", None)
+        if sidebar_grip is not None and watched is sidebar_grip:
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._sidebar_dragging = True
+                self._sidebar_drag_start_x = int(event.globalPosition().x())
+                self._sidebar_drag_start_width = self._sidebar_width
+                sidebar_grip.grabMouse()
+                return True
+            if event_type == QEvent.Type.MouseMove and self._sidebar_dragging:
+                delta = int(event.globalPosition().x()) - self._sidebar_drag_start_x
+                self._set_sidebar_width(self._sidebar_drag_start_width + delta)
+                return True
+            if event_type == QEvent.Type.MouseButtonRelease and self._sidebar_dragging:
+                self._sidebar_dragging = False
+                sidebar_grip.releaseMouse()
+                return True
+            if event_type == QEvent.Type.MouseButtonDblClick:
+                self._set_sidebar_width(280)
+                return True
+
+        if (
+            event.type() == QEvent.Type.Show
+            and isinstance(watched, QWidget)
+            and watched.isWindow()
+        ):
+            QTimer.singleShot(
+                0, lambda widget=watched: apply_widget_language(widget, self._language)
+        )
+        return super().eventFilter(watched, event)
+
+    def _build_sidebar_resize_grip(self):
+        grip = QFrame(self)
+        grip.setObjectName("sidebarResizeGrip")
+        grip.setFixedWidth(8)
+        grip.setCursor(Qt.CursorShape.SizeHorCursor)
+        grip.setToolTip("拖动调整侧边栏宽度，双击恢复默认宽度")
+        grip.setStyleSheet(
+            "QFrame#sidebarResizeGrip{background:transparent;}"
+            "QFrame#sidebarResizeGrip:hover{background:rgba(15,111,255,45);}"
+        )
+        grip.installEventFilter(self)
+        self._sidebar_resize_grip = grip
+        self._position_sidebar_resize_grip()
+        grip.show()
+        grip.raise_()
+
+    def _set_sidebar_width(self, width: int):
+        width = max(self._sidebar_min_width, min(self._sidebar_max_width, int(width)))
+        if width == self._sidebar_width:
+            return
+        self._sidebar_width = width
+        self.navigationInterface.setExpandWidth(width)
+        self.navigationInterface.expand(useAni=False)
+        self._position_sidebar_resize_grip()
+
+    def _position_sidebar_resize_grip(self):
+        sidebar_grip = getattr(self, "_sidebar_resize_grip", None)
+        if not sidebar_grip:
+            return
+        nav = self.navigationInterface.geometry()
+        x = max(0, nav.x() + nav.width() - 4)
+        sidebar_grip.setGeometry(x, 0, 8, self.height())
+        sidebar_grip.raise_()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
+        if reason == QSystemTrayIcon.ActivationReason.Context:
+            self._show_tray_menu()
+            return
+        if reason not in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            return
+        self._restore_from_notification()
+
+    def _build_tray_menu(self):
+        if not self._tray_icon:
+            return
+        menu = RoundMenu(parent=self)
+
+        open_action = Action(FIF.HOME, "打开主界面")
+        open_action.triggered.connect(lambda checked=False: self._restore_from_notification())
+        menu.addAction(open_action)
+        menu.addSeparator()
+
+        self._tray_pause_action = Action(FIF.PAUSE, "暂停下载")
+        self._tray_pause_action.setEnabled(False)
+        self._tray_pause_action.triggered.connect(
+            lambda checked=False: self.tray_pause_requested.emit()
+        )
+        menu.addAction(self._tray_pause_action)
+
+        self._tray_resume_action = Action(FIF.PLAY, "继续下载")
+        self._tray_resume_action.setEnabled(False)
+        self._tray_resume_action.triggered.connect(
+            lambda checked=False: self.tray_resume_requested.emit()
+        )
+        menu.addAction(self._tray_resume_action)
+
+        self._tray_stop_action = Action(FIF.CLOSE, "停止下载")
+        self._tray_stop_action.setEnabled(False)
+        self._tray_stop_action.triggered.connect(
+            lambda checked=False: self.tray_stop_requested.emit()
+        )
+        menu.addAction(self._tray_stop_action)
+        menu.addSeparator()
+
+        folder_action = Action(FIF.FOLDER, "打开保存目录")
+        folder_action.triggered.connect(
+            lambda checked=False: self.open_folder_requested.emit()
+        )
+        menu.addAction(folder_action)
+
+        close_action = Action(FIF.POWER_BUTTON, "关闭应用")
+        close_action.triggered.connect(lambda checked=False: self._quit_from_tray())
+        menu.addAction(close_action)
+
+        self._tray_menu = menu
+
+    def _show_tray_menu(self):
+        if not self._tray_menu:
+            return
+        if self._tray_menu.isVisible():
+            self._tray_menu.hide()
+
+        cursor = QCursor.pos()
+        screen = QApplication.screenAt(cursor) or QApplication.primaryScreen()
+        if screen is None:
+            self._tray_menu.exec(cursor, ani=False, aniType=MenuAnimationType.NONE)
+            return
+
+        area = screen.availableGeometry()
+        size = self._tray_menu.sizeHint()
+        margin = 8
+        width = max(1, size.width())
+        height = max(1, size.height())
+
+        x = min(cursor.x(), area.right() - width - margin)
+        x = max(area.left() + margin, x)
+        space_below = area.bottom() - cursor.y()
+        if space_below >= height + margin:
+            y = cursor.y() + margin
+        else:
+            y = cursor.y() - height - margin
+        y = max(area.top() + margin, min(y, area.bottom() - height - margin))
+
+        self._tray_menu.exec(
+            QPoint(x, y),
+            ani=False,
+            aniType=MenuAnimationType.NONE,
+        )
+
+    def _quit_from_tray(self):
+        self._closing = True
+        self.hide()
+        if self._tray_icon:
+            self._tray_icon.hide()
+        self.tray_quit_requested.emit()
+
+    def _restore_from_notification(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def refresh_tooltip_theme(self):
+        apply_tooltip_theme()
+
+    def center_on_screen(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        frame = self.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        self.move(frame.topLeft())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._position_sidebar_resize_grip()
+        if self._initially_centered:
+            return
+        self._initially_centered = True
+        # Wait until FluentWindow finishes its first layout and frame sizing.
+        QTimer.singleShot(0, self.center_on_screen)
+        QTimer.singleShot(0, self._position_sidebar_resize_grip)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_sidebar_resize_grip()
 
     def closeEvent(self, event: QCloseEvent):
+        if self._closing:
+            event.accept()
+            return
+        if self._tray_icon and self._tray_icon.isVisible():
+            event.ignore()
+            self.hide()
+            return
+        self._closing = True
+        event.ignore()
+        self.hide()
         self.window_closing.emit()
-        super().closeEvent(event)

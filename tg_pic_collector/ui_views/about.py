@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .. import __version__
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
 
@@ -17,7 +18,8 @@ class AboutPage(ScrollPage):
             "使用 Telethon、PySide6 与 QFluentWidgets 构建。\n"
             "用于按 Tag 搜索频道帖子，并整理评论区中的图片。"
         ))
-        text.addWidget(BodyLabel("版本 v2.3.0"))
+        text.addWidget(BodyLabel(f"版本 v{__version__}"))
+        text.addWidget(_muted("GNU GPL-3.0 开源软件 · 不提供任何担保"))
         text.addStretch()
         row.addLayout(text, 1)
         card.body.addLayout(row)

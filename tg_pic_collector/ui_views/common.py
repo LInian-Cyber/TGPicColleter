@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QIcon,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QLinearGradient,
@@ -36,12 +37,15 @@ from PySide6.QtWidgets import (
     QWidget,
     QSpacerItem,
     QAbstractItemView,
+    QApplication,
     QHeaderView,
     QPlainTextEdit,
     QProgressBar,
     QScrollArea,
     QStyle,
     QStyledItemDelegate,
+    QSystemTrayIcon,
+    QToolTip,
 )
 from qfluentwidgets import (
     BodyLabel,
@@ -94,6 +98,27 @@ def get_theme_color(light_color: str, dark_color: str) -> str:
     """根据当前主题返回对应的颜色"""
     from qfluentwidgets import isDarkTheme
     return dark_color if isDarkTheme() else light_color
+
+
+def apply_tooltip_theme() -> None:
+    """Update tooltip colors without rebuilding the application's style sheet."""
+    app = QApplication.instance()
+    if app is None:
+        return
+    from qfluentwidgets import isDarkTheme
+
+    if isDarkTheme():
+        background, foreground = "#252a34", "#f5f7fb"
+    else:
+        background, foreground = "#ffffff", "#1a2233"
+
+    palette = QToolTip.palette()
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(background))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(foreground))
+    palette.setColor(QPalette.ColorRole.Window, QColor(background))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(foreground))
+    QToolTip.setPalette(palette)
+
 
 C_BLUE = "#0f6fff"
 C_GREEN = "#18a66a"
@@ -261,8 +286,9 @@ class PassiveTableWidget(QTableWidget):
         self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMouseTracking(False)
-        self.viewport().setMouseTracking(False)
+        # 保持 mouseTracking 开启，否则 tooltip 无法正常触发
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self.setItemDelegate(PassiveItemDelegate(self))
 
     def mousePressEvent(self, event):
@@ -308,6 +334,7 @@ class ScrollPage(ScrollArea):
         _set_margins(self.root, (28, 24, 28, 28), 16)
         self.root.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.setWidget(self._content)
+        apply_tooltip_theme()
 
     def _page_header(self, title: str, subtitle: str,
                      illus: str = "download-illustration.png",
@@ -529,22 +556,41 @@ class SearchPreviewDialog(MessageBoxBase):
     def set_progress(self, message: str):
         self._status.setText(message)
 
-    def set_results(self, rows: list[dict]):
+    def set_results(self, rows: list[dict], total_count: int, display_limit: int):
         self._progress.hide()
         self.cancelButton.hide()
         self._clear_results()
         image_total = sum(int(row.get("image_count", 0)) for row in rows)
-        self._status.setText(
-            f"找到 {len(rows)} 篇帖子，评论区共发现 {image_total} 张图片"
-            if rows
-            else "没有找到匹配的帖子"
-        )
+        hidden_count = max(0, total_count - len(rows))
+        if hidden_count:
+            self._status.setText(
+                f"本次扫描范围内共找到 {total_count} 篇帖子，当前展示 {len(rows)} 篇，"
+                f"还有 {hidden_count} 篇未展示；已展示帖子评论区共发现 {image_total} 张图片"
+            )
+        elif rows:
+            self._status.setText(
+                f"本次扫描范围内共找到 {total_count} 篇帖子，"
+                f"评论区共发现 {image_total} 张图片"
+            )
+        else:
+            self._status.setText("没有找到匹配的帖子")
         if not rows:
             empty = SurfaceCard()
             empty.body.addWidget(SubtitleLabel("暂无搜索结果"))
             empty.body.addWidget(_muted("请检查频道地址与 Tag，或尝试扩大默认检查帖子数量。"))
             self._results_layout.addWidget(empty)
             return
+
+        if hidden_count:
+            notice = SurfaceCard()
+            notice.body.addWidget(StrongBodyLabel(
+                f"预览最多展示 {display_limit} 篇帖子"
+            ))
+            notice.body.addWidget(_muted(
+                f"本次共找到 {total_count} 篇，还有 {hidden_count} 篇未展示。"
+                "正式下载仍会按照默认扫描帖子数量完整处理。"
+            ))
+            self._results_layout.addWidget(notice)
 
         for row in rows:
             card = SurfaceCard()
