@@ -1,0 +1,33 @@
+.idea/
+.venv/
+.pip-tmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+
+# Telegram credentials and local sessions
+tg-api.txt
+*.session
+*.session-journal
+*.session.encrypted
+*.session.decrypted
+
+# Build output
+dist/
+build/
+
+# Local design exports and scratch files
+ui/
+新建文件夹/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+desktop.ini
