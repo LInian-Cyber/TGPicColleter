@@ -38,7 +38,9 @@ def run() -> int:
     QApplication.setApplicationDisplayName(APP_NAME)
     QApplication.setOrganizationName("TGCommentCollector")
     app = QApplication(sys.argv)
-    app.setFont(QFont("Segoe UI Variable", 10))
+    ui_font_family = "Microsoft YaHei UI" if sys.platform == "win32" else "Noto Sans CJK SC"
+    app.setFont(QFont(ui_font_family, 10))
+    app.setStyleSheet(f"QWidget{{font-family:'{ui_font_family}';}}")
     app.setQuitOnLastWindowClosed(False)
     config = AppConfig.load()
     theme = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}.get(

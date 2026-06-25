@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
@@ -10,6 +11,9 @@ class SettingsPage(ScrollPage):
     logout_requested = Signal()
     cache_clear_requested = Signal()
     language_preview_requested = Signal(str)
+    channel_cache_refresh_requested = Signal()
+    channel_cache_delete_requested = Signal(str)
+    channel_cache_clear_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__("settingsPage", parent)
@@ -35,10 +39,14 @@ class SettingsPage(ScrollPage):
             )
         self._seg.setCurrentItem("tab_0")
         self.root.addWidget(self._seg)
+        self._stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._stack.currentChanged.connect(self.refresh_layout)
         self.root.addWidget(self._stack)
+        QTimer.singleShot(0, self.refresh_layout)
 
         # 底部操作栏
         foot = SurfaceCard()
+        foot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         foot_row = QHBoxLayout()
         foot_row.addWidget(_muted("ⓘ  设置仅在本机生效，不会上传到云端。"))
         foot_row.addStretch()
@@ -56,7 +64,40 @@ class SettingsPage(ScrollPage):
         foot_row.addWidget(restore_btn)
         foot_row.addWidget(save_btn)
         foot.body.addLayout(foot_row)
-        self.root.addWidget(foot)
+        self.root.addWidget(foot, 0, Qt.AlignmentFlag.AlignTop)
+
+    def _sync_stack_height(self, *_):
+        stack = getattr(self, "_stack", None)
+        if stack is None:
+            return
+        page = stack.currentWidget()
+        if page is None:
+            return
+        width = max(1, stack.width())
+        layout = page.layout()
+        if layout is not None:
+            layout.activate()
+        heights = [page.sizeHint().height(), page.minimumSizeHint().height(), 1]
+        if layout is not None:
+            heights.append(layout.sizeHint().height())
+            if layout.hasHeightForWidth() and width > 1:
+                heights.append(layout.heightForWidth(width))
+        height = max(heights)
+        if stack.minimumHeight() == height and stack.maximumHeight() == height:
+            return
+        stack.setMinimumHeight(height)
+        stack.setMaximumHeight(height)
+        stack.updateGeometry()
+        self._content.updateGeometry()
+
+    def refresh_layout(self, *_):
+        self._sync_stack_height()
+        QTimer.singleShot(0, self._sync_stack_height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_stack"):
+            self.refresh_layout()
 
     # ── Tab 页面构建
     def _build_general(self) -> QWidget:
@@ -91,15 +132,19 @@ class SettingsPage(ScrollPage):
         ]:
             self.mode_combo.addItem(text, userData=key)
         dl.body.addWidget(self.mode_combo)
+        self._save_mode_preview_lbl = _muted("")
+        dl.body.addWidget(self._save_mode_preview_lbl)
+        self.path_edit.textChanged.connect(self._update_save_mode_preview)
+        self.mode_combo.currentIndexChanged.connect(self._update_save_mode_preview)
         dl.body.addWidget(_muted("按每个 Tag 自动创建独立文件夹，便于分类管理。"))
-        dl.body.addWidget(StrongBodyLabel("每次最多检查帖子数量"))
+        dl.body.addWidget(StrongBodyLabel("每次最多匹配帖子数量"))
         self.max_posts = SpinBox()
         self.max_posts.setRange(1, 5000)
         self.max_posts.setValue(200)
         self.max_posts.setMinimumSize(180, 36)
         dl.body.addWidget(self.max_posts)
         dl.body.addWidget(_muted(
-            "该数值限制每次从频道中检查的帖子数量，不是图片数量；"
+            "该数值限制每次任务最多处理的匹配帖子数量，不是图片数量；"
             "每篇帖子内符合条件的图片和正文原图链接都会继续处理。"
         ))
         dl.body.addWidget(StrongBodyLabel("搜索预览最多展示帖子数"))
@@ -134,6 +179,33 @@ class SettingsPage(ScrollPage):
             row.addWidget(sw)
             launch.body.addLayout(row)
             launch.body.addWidget(_divider())
+        launch.body.addWidget(StrongBodyLabel("点击窗口关闭按钮时"))
+        close_behavior_row = QHBoxLayout()
+        close_behavior_row.setSpacing(18)
+        self._close_behavior_radios: dict[str, RadioButton] = {}
+        for text, key in [
+            ("首次询问", "ask"),
+            ("最小化到托盘", "minimize"),
+            ("退出应用", "exit"),
+        ]:
+            rb = RadioButton(text)
+            self._close_behavior_radios[key] = rb
+            close_behavior_row.addWidget(rb)
+        close_behavior_row.addStretch()
+        self._close_behavior_radios["ask"].setChecked(True)
+        launch.body.addLayout(close_behavior_row)
+
+        launch.body.addWidget(_muted("当选择“首次询问”时，弹窗内也可以决定是否记住本次选择。"))
+        close_remember_row = QHBoxLayout()
+        close_remember_row.setSpacing(18)
+        self._close_remember_radios: dict[bool, RadioButton] = {}
+        for text, key in [("记住选择", True), ("仅本次", False)]:
+            rb = RadioButton(text)
+            self._close_remember_radios[key] = rb
+            close_remember_row.addWidget(rb)
+        close_remember_row.addStretch()
+        self._close_remember_radios[False].setChecked(True)
+        launch.body.addLayout(close_remember_row)
         grid.addWidget(launch, 0, 1)
 
         # 当前默认摘要（右侧固定列）
@@ -369,6 +441,33 @@ class SettingsPage(ScrollPage):
         grid.addWidget(guide_card, 0, 2)
 
         layout.addLayout(grid)
+        cache_card = SurfaceCard("频道缓存", "缓存最近搜索/加载到的频道名称、头像和链接；可手动刷新或删除。")
+        cache_actions = QHBoxLayout()
+        cache_actions.addWidget(_muted("粘贴 t.me/c/.../123 时会自动识别频道部分并写入缓存。"))
+        cache_actions.addStretch()
+        refresh_btn = PushButton("刷新频道信息", icon=FIF.SYNC)
+        clear_btn = PushButton("清空频道缓存", icon=FIF.DELETE)
+        refresh_btn.clicked.connect(self.channel_cache_refresh_requested)
+        clear_btn.clicked.connect(self.channel_cache_clear_requested)
+        cache_actions.addWidget(refresh_btn)
+        cache_actions.addWidget(clear_btn)
+        cache_card.body.addLayout(cache_actions)
+
+        self._channel_cache_table = PassiveTableWidget(0, 4)
+        self._channel_cache_table.setHorizontalHeaderLabels(["名称", "频道/ID", "链接", "操作"])
+        self._channel_cache_table.verticalHeader().hide()
+        self._channel_cache_table.horizontalHeader().setStretchLastSection(False)
+        self._channel_cache_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._channel_cache_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._channel_cache_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._channel_cache_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self._channel_cache_table.setColumnWidth(3, 72)
+        self._channel_cache_table.setMinimumHeight(220)
+        self._channel_cache_table.setShowGrid(False)
+        self._channel_cache_table.setAlternatingRowColors(False)
+        self._channel_cache_table.refresh_theme()
+        cache_card.body.addWidget(self._channel_cache_table)
+        layout.addWidget(cache_card)
         layout.addStretch()
         return w
 
@@ -445,6 +544,20 @@ class SettingsPage(ScrollPage):
         layout.addStretch()
         return w
 
+    def _update_save_mode_preview(self):
+        root_text = self.path_edit.text().strip() or str(Path.home() / "Pictures" / "TG Pic Collector")
+        mode = self.mode_combo.currentData() or "channel_tag"
+        root = Path(root_text)
+        examples = {
+            "channel_tag": root / "示例频道" / "Nicole" / "20260617_post1024.jpg",
+            "tag": root / "Nicole" / "20260617_post1024.jpg",
+            "post": root / "Nicole" / "post_1024" / "20260617_post1024.jpg",
+            "flat": root / "20260617_post1024.jpg",
+        }
+        path = examples.get(mode, examples["channel_tag"])
+        if hasattr(self, "_save_mode_preview_lbl"):
+            self._save_mode_preview_lbl.setText(f"示例保存路径：{path}")
+
     def _choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择默认保存目录", self.path_edit.text())
         if d:
@@ -490,6 +603,8 @@ class SettingsPage(ScrollPage):
         self.last_mode_cb.setChecked(True)
         self.auto_tag_cb.setChecked(True)
         self.notification_sw.setChecked(True)
+        self._close_behavior_radios["ask"].setChecked(True)
+        self._close_remember_radios[False].setChecked(True)
 
     def _collect(self) -> dict:
         mode = self.mode_combo.currentData() or "channel_tag"
@@ -508,6 +623,11 @@ class SettingsPage(ScrollPage):
             "use_last_mode": self.last_mode_cb.isChecked(),
             "auto_fill_tag": self.auto_tag_cb.isChecked(),
             "enable_system_notifications": self.notification_sw.isChecked(),
+            "close_behavior": next(
+                (key for key, rb in self._close_behavior_radios.items() if rb.isChecked()),
+                "ask",
+            ),
+            "remember_close_behavior": self._close_remember_radios[True].isChecked(),
             "skip_duplicates": dup,
             "filename_template": self.filename_edit.text().strip(),
             "preserve_original_name": self.preserve_original_sw.isChecked(),
@@ -565,6 +685,12 @@ class SettingsPage(ScrollPage):
             self.auto_tag_cb.setChecked(bool(d["auto_fill_tag"]))
         if "enable_system_notifications" in d:
             self.notification_sw.setChecked(bool(d["enable_system_notifications"]))
+        if "close_behavior" in d:
+            rb = self._close_behavior_radios.get(d["close_behavior"])
+            if rb:
+                rb.setChecked(True)
+        if "remember_close_behavior" in d:
+            self._close_remember_radios[bool(d["remember_close_behavior"])].setChecked(True)
         if "skip_duplicates" in d:
             key = d["skip_duplicates"]
             if isinstance(key, bool):
@@ -595,6 +721,48 @@ class SettingsPage(ScrollPage):
             self.encrypt_sw.setChecked(
                 sys.platform == "win32" and bool(d["use_dpapi_encryption"])
             )
+        self._update_save_mode_preview()
+        QTimer.singleShot(0, self._sync_stack_height)
+
+    def set_channel_cache(self, rows: list[dict]):
+        if not hasattr(self, "_channel_cache_table"):
+            return
+        self._channel_cache_table.setUpdatesEnabled(False)
+        self._channel_cache_table.setRowCount(0)
+        for item in rows:
+            channel_id = str(item.get("id", "")).strip()
+            if not channel_id:
+                continue
+            row = self._channel_cache_table.rowCount()
+            self._channel_cache_table.insertRow(row)
+            name = str(item.get("name", "") or "未命名频道")
+            link = str(item.get("link", "") or channel_id)
+            values = [name, channel_id, link]
+            for col, value in enumerate(values):
+                table_item = QTableWidgetItem(value)
+                table_item.setToolTip(value)
+                self._channel_cache_table.setItem(row, col, table_item)
+
+            delete_btn = ToolButton(FIF.DELETE)
+            delete_btn.setFixedSize(28, 28)
+            delete_btn.setToolTip("删除这条频道缓存")
+            delete_btn.clicked.connect(
+                lambda checked=False, cid=channel_id: self.channel_cache_delete_requested.emit(cid)
+            )
+            ops_widget = QWidget()
+            ops_layout = QHBoxLayout(ops_widget)
+            ops_layout.setContentsMargins(4, 4, 4, 4)
+            ops_layout.addStretch()
+            ops_layout.addWidget(delete_btn)
+            ops_layout.addStretch()
+            self._channel_cache_table.setCellWidget(row, 3, ops_widget)
+            self._channel_cache_table.setRowHeight(row, 38)
+        self._channel_cache_table.setUpdatesEnabled(True)
+        QTimer.singleShot(0, self._sync_stack_height)
+
+    def refresh_theme(self):
+        if hasattr(self, "_channel_cache_table"):
+            self._channel_cache_table.refresh_theme()
 
     def set_session_status(self, loaded: bool, message: str = ""):
         if loaded:

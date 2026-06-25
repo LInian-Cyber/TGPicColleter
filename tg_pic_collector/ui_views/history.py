@@ -16,6 +16,7 @@ class HistoryPage(ScrollPage):
 
     def __init__(self, parent=None):
         super().__init__("historyPage", parent)
+        self._raw_log_content = ""
         self._page_header("任务与历史", "集中查看当前任务、下载记录与运行日志",
                           illus="download-illustration.png")
 
@@ -82,10 +83,7 @@ class HistoryPage(ScrollPage):
         self._queue_table.setShowGrid(False)
         self._queue_table.setAlternatingRowColors(False)
         self._queue_table.setMinimumHeight(300)
-        self._queue_table.setStyleSheet(
-            "QTableWidget{border:none;background:transparent;}"
-            "QTableWidget::item:selected,QTableWidget::item:hover{background:transparent;}"
-        )
+        self._queue_table.refresh_theme()
         card.body.addWidget(self._queue_table)
         layout.addWidget(card)
         return page
@@ -119,10 +117,7 @@ class HistoryPage(ScrollPage):
         self._table.setShowGrid(False)
         self._table.setAlternatingRowColors(False)
         self._table.setMinimumHeight(420)
-        self._table.setStyleSheet(
-            "QTableWidget{border:none;background:transparent;}"
-            "QTableWidget::item:selected,QTableWidget::item:hover{background:transparent;}"
-        )
+        self._table.refresh_theme()
         card.body.addWidget(self._table)
         layout.addWidget(card)
         return page
@@ -137,6 +132,16 @@ class HistoryPage(ScrollPage):
         self._log_path_label = _muted("日志文件：-")
         self._log_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         actions.addWidget(self._log_path_label, 1)
+        self._log_filter_combo = ComboBox()
+        for text, key in [
+            ("全部日志", "all"),
+            ("只看错误", "error"),
+            ("高级规则", "advanced"),
+            ("下载结果", "download"),
+        ]:
+            self._log_filter_combo.addItem(text, userData=key)
+        self._log_filter_combo.currentIndexChanged.connect(self._apply_log_filter)
+        actions.addWidget(self._log_filter_combo)
         open_file_btn = PushButton("打开日志文件", icon=FIF.DOCUMENT)
         open_folder_btn = PushButton("打开日志目录", icon=FIF.FOLDER)
         open_file_btn.clicked.connect(self.open_log_requested)
@@ -149,6 +154,7 @@ class HistoryPage(ScrollPage):
         self._log_view.setReadOnly(True)
         self._log_view.setMinimumHeight(420)
         self._log_view.setPlaceholderText("日志会在任务开始后显示在这里。")
+        self._log_view.setStyleSheet(plain_text_qss())
         card.body.addWidget(self._log_view)
         layout.addWidget(card)
         return page
@@ -205,6 +211,10 @@ class HistoryPage(ScrollPage):
                 f"(下载 {task.downloaded} / 跳过 {skipped})"
             )
             result_item.setToolTip(tooltip)
+            metrics_text = str(getattr(task, "metrics_text", "") or "")
+            if metrics_text:
+                result_item.setText(f"{result_item.text()}\n{metrics_text}")
+                result_item.setToolTip(f"{tooltip}\n{metrics_text}")
             self._queue_table.setItem(row, 4, result_item)
 
             ops_widget = QWidget()
@@ -228,11 +238,36 @@ class HistoryPage(ScrollPage):
             ops_layout.addWidget(pause_btn)
             ops_layout.addWidget(delete_btn)
             self._queue_table.setCellWidget(row, 5, ops_widget)
-            self._queue_table.setRowHeight(row, 44)
+            self._queue_table.setRowHeight(row, 56 if metrics_text else 44)
         self._queue_table.setUpdatesEnabled(True)
 
     def set_log(self, path: str, content: str):
         self._log_path_label.setText(f"日志文件：{path}")
+        self._raw_log_content = content
+        self._apply_log_filter()
+        scrollbar = self._log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def refresh_theme(self):
+        self._queue_table.refresh_theme()
+        self._table.refresh_theme()
+        self._log_view.setStyleSheet(plain_text_qss())
+        self._log_view.viewport().update()
+
+    def _apply_log_filter(self):
+        content = self._raw_log_content
+        mode = self._log_filter_combo.currentData() if hasattr(self, "_log_filter_combo") else "all"
+        if mode != "all":
+            markers = {
+                "error": ("[ERROR]", "ERROR", "失败", "错误", "Exception"),
+                "advanced": ("高级", "深度", "正文链接", "评论区", "跃迁", "Telegram 内部链接"),
+                "download": ("已下载", "下载", "跳过", "已完成", "保存真实媒体"),
+            }.get(mode, ())
+            lines = [
+                line for line in content.splitlines()
+                if any(marker in line for marker in markers)
+            ]
+            content = "\n".join(lines) if lines else "当前筛选条件下暂无日志。"
         self._log_view.setPlainText(content)
         scrollbar = self._log_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())

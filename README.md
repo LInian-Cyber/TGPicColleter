@@ -1,8 +1,24 @@
 # TG Pic Collector
 
-TG Pic Collector 是一个使用 Telethon、PySide6 与 PySide6-Fluent-Widgets 编写的桌面工具。它可以按 Tag 搜索频道帖子，预览命中的对话与图片，并下载帖子及评论区中的图片。
+TG Pic Collector 是一个使用 Telethon、PySide6 与 PySide6-Fluent-Widgets 编写的 Telegram 图片下载桌面工具。它可以按频道和 Tag 搜索帖子，预览命中的帖子、评论区图片与原图链接，并把图片按规则保存到本地。
 
-支持二维码登录、手机号验证码登录、两步验证、本地 Session 恢复、自定义保存规则、下载历史，以及按按钮关键词提取原图链接。
+本项目不是 Telegram 官方产品，也不受 Telegram 官方认可。下载和使用内容时，请遵守目标频道规则、内容版权要求与 Telegram API Terms。
+
+## 功能
+
+- 支持手机号验证码登录、二维码登录、两步验证、本地 Session 恢复。
+- 支持多账号本地会话列表，已登录账号可免扫码切换。
+- 支持频道用户名、频道 ID、`t.me/...`、`t.me/c/.../消息ID` 输入。
+- 支持按 Tag 搜索，也支持不填 Tag 扫描全部帖子。
+- 支持日期范围筛选、最多检查帖子数、搜索预览最多展示数量。
+- 支持下载帖子评论区图片、回复图片、正文超链接、按钮链接和评论区原图链接。
+- 支持高级提取规则，用于 SFW/NSFW、正文链接、评论链接、套娃跳转等复杂频道结构。
+- 支持扫描与下载并行队列、下载速度、队列剩余、ETA、暂停、继续、停止。
+- 支持保存模式、保留原名、自定义命名、重复文件处理、扩展信息 sidecar。
+- 支持下载历史、任务记录、日志查看、频道缓存管理。
+- 支持首页统计、下载趋势、常用 Tag、系统托盘、Windows 系统通知。
+- 支持浅色、深色、跟随系统主题，以及中英文界面切换。
+- 支持 IGP / 元数据导出。
 
 ## 支持平台
 
@@ -29,15 +45,32 @@ Windows PowerShell 激活虚拟环境后，也可以运行：
 .\.venv\Scripts\python.exe main.py
 ```
 
-首次使用前，在 [my.telegram.org](https://my.telegram.org/apps) 创建应用并获取 `API ID` 和 `API Hash`，然后在应用的“设置 -> 会话与安全”中填写凭据。二维码和手机号登录都需要这两个凭据。
+首次使用前，在 https://my.telegram.org/apps 创建应用并获取 `API ID` 和 `API Hash`，然后在应用的“设置 -> 会话与安全”中填写凭据。二维码和手机号登录都需要这两个凭据。
 
 ## 使用说明
 
-- 账号需要有权访问目标频道及其关联评论区。
-- Tag 搜索基于 Telegram 服务端搜索，并再次检查帖子文本。
-- 按钮链接在 Windows 保存为 `.url`，macOS 保存为 `.webloc`，Linux 保存为 `.desktop`。
-- 配置、API 凭据与 Telethon Session 保存在操作系统的用户应用数据目录，不会写入项目目录或打进安装包。
-- Windows 可使用 DPAPI 加密 Session；macOS 与 Linux 当前依赖用户目录权限保护。
+1. 在“设置 -> 会话与安全”填写 Telegram `API ID`、`API Hash`。
+2. 在“登录中心”使用二维码或手机号登录。
+3. 在“下载任务”填写频道、Tag、保存目录和本次下载选项。
+4. 可先点“搜索预览”，确认命中来源、缩略图和追踪链路。
+5. 点击“开始下载”，下载完成后可打开目录或在历史中查看记录。
+
+常见配置：
+
+- “每次最多检查帖子数量”限制本次从频道里匹配多少篇帖子，不是图片数量。
+- “搜索预览最多展示帖子数”只影响预览弹窗，不影响实际下载总数。
+- “包含回复中的图片”控制是否读取评论区/回复区。
+- “追踪帖子正文超链接并下载原图”会追踪正文、按钮、评论中的 Telegram 帖子链接，并下载目标帖子的真实媒体。
+- “高级提取规则”适合复杂频道，例如 A 帖正文跳 B、A/B 评论链接再跳 C/D 原图资源帖。
+
+## 本地数据与安全
+
+- 配置、API 凭据、账号列表与 Telethon Session 保存在操作系统用户应用数据目录，不会写入项目目录或打进安装包。
+- Windows 可启用 DPAPI 加密 Session；macOS 与 Linux 当前依赖用户目录权限保护。
+- 不要提交 `tg-api.txt`、`.session`、`.env`、登录验证码、两步验证密码、手机号或任何真实 API 凭据。
+- 报告安全问题时，请通过 GitHub Security Advisories 私下提交，不要在公开 issue 中附带敏感信息。
+
+已忽略的本地文件包括 `.venv/`、`build/`、`dist/`、`tg-api.txt`、`.session`、`ui/` 设计稿和本地临时目录。
 
 ## 本地打包
 
@@ -54,17 +87,21 @@ Windows 也可以使用：
 .\build_exe.ps1
 ```
 
-默认构建为启动更快、运行更稳定的 `onedir`。Windows 如需单文件版本可运行 `.\build_exe.ps1 -OneFile`。
+默认构建为启动更快、运行更稳定的 `onedir`。Windows 如需单文件版本可运行：
 
-## 使用 GitHub Actions 发布
+```powershell
+.\build_exe.ps1 -OneFile
+```
 
-仓库包含 [`.github/workflows/release.yml`](.github/workflows/release.yml)，会在不同系统的 GitHub Runner 上分别构建，不能也不需要在本机安装另外两个操作系统。
+## GitHub Actions 发布
+
+仓库包含 `.github/workflows/release.yml`，会在不同系统的 GitHub Runner 上分别构建，不能也不需要在本机安装另外两个操作系统。
 
 首次发布：
 
 ```bash
 git add .
-git commit -m "Prepare v2.3.1 release"
+git commit -m "Prepare release"
 git branch -M main
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
@@ -72,18 +109,52 @@ git tag v2.3.1
 git push origin v2.3.1
 ```
 
-推送 `v*` 标签后，在 GitHub 的 **Actions** 页面可以查看四个平台的构建进度。全部完成后，工作流会自动创建对应标签的 **Release**，并上传四个压缩包。
+推送 `v*` 标签后，在 GitHub 的 Actions 页面可以查看四个平台的构建进度。全部完成后，工作流会自动创建对应标签的 Release，并上传四个压缩包。
 
-也可以在 **Actions -> Build release -> Run workflow** 手动构建。手动运行只生成可下载的 Actions Artifacts，不会创建正式 Release。
+也可以在 Actions -> Build release -> Run workflow 手动构建。手动运行只生成可下载的 Actions Artifacts，不会创建正式 Release。
 
-## 发布注意事项
+## 贡献
 
-- 不要提交 `tg-api.txt`、`.session`、`.env` 或任何真实 API 凭据。
-- macOS 发布包当前没有 Apple Developer 签名和公证，Gatekeeper 可能提示无法验证开发者。
-- Linux 当前发布便携压缩包，不是 AppImage、Flatpak 或系统安装包。
-- 下载和使用内容时，请遵守目标频道规则、内容版权要求与 [Telegram API Terms](https://core.telegram.org/api/terms)。
-- 本项目不是 Telegram 官方产品，也不受 Telegram 官方认可。
+欢迎提交 issue 和 pull request。
 
-## 开源许可
+- 从 `main` 创建功能分支。
+- 不要提交 Telegram API 凭据、手机号、登录验证码、两步验证密码或 Session 文件。
+- 保持 UI 与项目现有 Fluent 桌面风格一致。
+- PR 中请说明用户可见变化、平台影响和验证方式。
 
-本项目使用 [GNU GPL-3.0](LICENSE) 发布，因为开源版本使用的 PySide6-Fluent-Widgets 采用 GPL-3.0。第三方依赖说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+贡献代码将按本项目许可证发布。
+
+## 更新记录
+
+### 当前版本
+
+- 完善下载链路、多账号切换、搜索预览、系统托盘、系统通知、关闭行为和任务恢复。
+- 增加日期筛选、预览直下、高级规则追踪、并行下载队列、速度与 ETA 显示。
+- 增加频道缓存管理、导出页、IGP / 元数据导出能力。
+- 优化首页布局、暗色主题、设置页布局和表格滚动体验。
+- 增加 GitHub Actions、PyInstaller spec、发布配置和忽略规则。
+
+### v2.3.1
+
+- 增加保存为模板、重置本次覆盖、继续上次任务。
+- 增加 Windows DPAPI 会话加密。
+- 增加动画、圆角、语言等设置项。
+- 优化任务页面表单布局和按钮尺寸。
+
+## 第三方组件
+
+主要依赖：
+
+- PySide6：LGPL-3.0/GPL-3.0
+- PySide6-Fluent-Widgets：开源使用 GPL-3.0
+- Telethon：MIT
+- PyInstaller：GPL-2.0 with special exception
+- qrcode / Pillow / cryptg：以各自上游许可证为准
+
+二进制发布包包含第三方组件，请以依赖包元数据和上游项目许可证为准。
+
+## 许可证
+
+本项目使用 GPL-3.0-only 发布，因为开源版本使用的 PySide6-Fluent-Widgets 采用 GPL-3.0。
+
+完整许可证文本见 `LICENSE`。

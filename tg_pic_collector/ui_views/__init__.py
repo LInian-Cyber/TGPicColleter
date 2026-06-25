@@ -2,6 +2,7 @@
 
 from .about import AboutPage
 from .common import HistoryRow, SearchPreviewDialog, TaskRow
+from .export import ExportPage
 from .history import HistoryPage
 from .home import HomePage
 from .login import LoginPage
@@ -11,6 +12,7 @@ from .task import TaskPage
 
 __all__ = [
     "AboutPage",
+    "ExportPage",
     "HistoryPage",
     "HistoryRow",
     "HomePage",

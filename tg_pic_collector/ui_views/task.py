@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 
+from ..models import normalize_channel_reference
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins, _set_round_avatar
 from PySide6.QtCore import Qt
@@ -47,6 +48,7 @@ class TaskPage(ScrollPage):
         self._default_save_root = ""
         self._default_mode_label = ""
         self._default_mode_key = ""
+        self._default_save_extended_info = False
         self._channel_list = []  # 存储频道列表
         self._custom_advanced_rules: list[dict] = []
         self._page_header("新建下载任务",
@@ -55,9 +57,9 @@ class TaskPage(ScrollPage):
         # 提示横幅
         notice = SurfaceCard()
         notice_row = QHBoxLayout()
-        ico = QLabel()
-        ico.setPixmap(FIF.INFO.icon().pixmap(16, 16))
-        notice_row.addWidget(ico)
+        self._notice_icon = QLabel()
+        set_theme_icon(self._notice_icon, FIF.INFO, 16)
+        notice_row.addWidget(self._notice_icon)
         notice_row.addWidget(BodyLabel(
             "  默认保存模式：沿用上次设置，可在本页临时覆盖；更多默认规则请前往 设置。"))
         notice_row.addStretch()
@@ -71,7 +73,7 @@ class TaskPage(ScrollPage):
         self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._avatar.setFixedSize(42, 42)
         self._avatar.setObjectName("taskAccountAvatar")
-        acct_row.addWidget(self._avatar)
+        acct_row.addWidget(self._avatar, 0, Qt.AlignmentFlag.AlignVCenter)
         acct_info = QVBoxLayout()
         acct_info.setSpacing(2)
         self._acct_title_row = QHBoxLayout()
@@ -85,7 +87,11 @@ class TaskPage(ScrollPage):
         self._acct_title_row.addStretch()
         self._acct_status = BodyLabel("● 未登录")
         self._acct_status.setObjectName("accountStatus")
-        self._acct_title_row.addWidget(self._acct_status)
+        self._acct_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._acct_status.setFixedHeight(36)
+        self._switch_btn = PushButton("切换账号", icon=FIF.SYNC)
+        self._switch_btn.setMinimumHeight(36)
+        self._switch_btn.clicked.connect(self.switch_account_requested)
         acct_info.addLayout(self._acct_title_row)
         # 数据中心 / 会话位置
         detail_row = QHBoxLayout()
@@ -99,9 +105,14 @@ class TaskPage(ScrollPage):
         detail_row.addStretch()
         acct_info.addLayout(detail_row)
         acct_row.addLayout(acct_info, 1)
-        self._switch_btn = PushButton("切换账号", icon=FIF.SYNC)
-        self._switch_btn.clicked.connect(self.switch_account_requested)
-        acct_row.addWidget(self._switch_btn)
+        control_widget = QWidget()
+        control_widget.setStyleSheet("background:transparent;")
+        control_row = QHBoxLayout(control_widget)
+        control_row.setContentsMargins(0, 0, 0, 0)
+        control_row.setSpacing(12)
+        control_row.addWidget(self._acct_status, 0, Qt.AlignmentFlag.AlignVCenter)
+        control_row.addWidget(self._switch_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        acct_row.addWidget(control_widget, 0, Qt.AlignmentFlag.AlignVCenter)
         self._acct_card.body.addLayout(acct_row)
         self.root.addWidget(self._acct_card)
 
@@ -140,6 +151,26 @@ class TaskPage(ScrollPage):
         self._common_tags_row = QHBoxLayout()
         self._common_tags_row.setSpacing(6)
         tag_col.addLayout(self._common_tags_row)
+        date_row = QHBoxLayout()
+        date_row.setSpacing(8)
+        self.date_filter_cb = CheckBox("按时间跨度筛选")
+        self.date_filter_cb.setToolTip("只匹配这个日期范围内的帖子。结束日期包含当天。")
+        self.start_date_edit = DateEdit()
+        self.start_date_edit.setDate(QDate.currentDate().addMonths(-1))
+        self.start_date_edit.setMinimumHeight(32)
+        self.start_date_edit.setEnabled(False)
+        self.end_date_edit = DateEdit()
+        self.end_date_edit.setDate(QDate.currentDate())
+        self.end_date_edit.setMinimumHeight(32)
+        self.end_date_edit.setEnabled(False)
+        self.date_filter_cb.stateChanged.connect(self._on_date_filter_changed)
+        date_row.addWidget(self.date_filter_cb)
+        date_row.addWidget(_muted("从", wrap=False))
+        date_row.addWidget(self.start_date_edit)
+        date_row.addWidget(_muted("到", wrap=False))
+        date_row.addWidget(self.end_date_edit)
+        date_row.addStretch()
+        tag_col.addLayout(date_row)
         self.set_common_tags([])
         form.addLayout(tag_col, 1, 1)
 
@@ -210,8 +241,18 @@ class TaskPage(ScrollPage):
         opts_row2.addWidget(self.btn_keyword_edit)
         opts_row2.addStretch()
 
+        opts_row3 = QHBoxLayout()
+        opts_row3.setSpacing(12)
+        self.save_ext_info_cb = CheckBox("保存图片扩展信息（IGP sidecar）")
+        self.save_ext_info_cb.setToolTip(
+            "下载成功后在图片旁边生成 .igp.json，保存 Tag、来源帖子、媒体 ID 等信息。"
+        )
+        opts_row3.addWidget(self.save_ext_info_cb)
+        opts_row3.addStretch()
+
         opts_col.addLayout(opts_row1)
         opts_col.addLayout(opts_row2)
+        opts_col.addLayout(opts_row3)
         opts_col.addWidget(_muted("ⓘ  默认行为已记忆，上次选择可自动恢复。"))
         form.addLayout(opts_col, 4, 1)
 
@@ -257,6 +298,24 @@ class TaskPage(ScrollPage):
         btn_row.addStretch()
         btn_row.addWidget(self._cancel_btn)
         form.addLayout(btn_row, 7, 0, 1, 2)
+        self._tag_empty_notice = QFrame()
+        self._tag_empty_notice.setObjectName("tagEmptyNotice")
+        self._tag_empty_notice.setStyleSheet(
+            "QFrame#tagEmptyNotice{background:#f6f9ff;border:1px solid #dbe8ff;"
+            "border-radius:10px;}"
+        )
+        notice_row = QHBoxLayout(self._tag_empty_notice)
+        notice_row.setContentsMargins(12, 8, 12, 8)
+        notice_row.setSpacing(8)
+        notice_icon = IconWidget(FIF.INFO)
+        notice_icon.setFixedSize(18, 18)
+        notice_row.addWidget(notice_icon, 0, Qt.AlignmentFlag.AlignTop)
+        notice_row.addWidget(_muted(
+            "未填写 Tag：将从最新帖子开始按匹配数量处理，保存时使用未分类或频道名规则。"
+        ), 1)
+        form.addWidget(self._tag_empty_notice, 8, 0, 1, 2)
+        self.tag_edit.textChanged.connect(self._update_tag_empty_notice)
+        self._update_tag_empty_notice()
 
         form_card.body.addLayout(form)
         body.addWidget(form_card, 3)
@@ -316,11 +375,46 @@ class TaskPage(ScrollPage):
         if idx >= 0:
             return self.channel_combo.itemData(idx) or text
         # 如果是用户纯手打的，直接返回手打文字
-        return text
+        normalized = normalize_channel_reference(text)
+        if normalized and normalized != text:
+            self.channel_combo.setText(normalized)
+        return normalized
     def _choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择图片保存位置", self.path_edit.text())
         if d:
             self.path_edit.setText(d)
+
+    def _on_date_filter_changed(self):
+        enabled = self.date_filter_cb.isChecked()
+        self.start_date_edit.setEnabled(enabled)
+        self.end_date_edit.setEnabled(enabled)
+
+    def _update_tag_empty_notice(self):
+        self._tag_empty_notice.setVisible(not self.tag_edit.text().strip())
+
+    def _collect_task_params(self) -> dict:
+        params = {
+            "channel": self._get_channel_input(),
+            "tag": self.tag_edit.text().strip(),
+            "save_root": self.path_edit.text().strip(),
+            "save_mode": self.mode_combo.currentData(),
+            "only_images": self.only_images_cb.isChecked(),
+            "skip_duplicates": self.skip_dup_cb.isChecked(),
+            "include_replies": self.include_replies_cb.isChecked(),
+            "extract_button_link": self.extract_btn_cb.isChecked(),
+            "button_keyword": self.btn_keyword_edit.text().strip(),
+            "open_after": self.open_after_cb.isChecked(),
+            "custom_extract_json": self._adv_json_str,
+            "save_extended_info": self.save_ext_info_cb.isChecked(),
+        }
+        if self.date_filter_cb.isChecked():
+            start = self.start_date_edit.date()
+            end = self.end_date_edit.date()
+            if start > end:
+                start, end = end, start
+            params["date_from"] = start.toString("yyyy-MM-dd")
+            params["date_to"] = end.toString("yyyy-MM-dd")
+        return params
 
     def _show_channel_menu(self):
         """显示频道选择菜单"""
@@ -389,43 +483,14 @@ class TaskPage(ScrollPage):
         menu.exec(self._channel_list_btn.mapToGlobal(self._channel_list_btn.rect().bottomLeft()))
 
     def _on_start(self):
-        params = {
-            "channel": self._get_channel_input(),  # ✨ 改用辅助方法提取
-            "tag": self.tag_edit.text().strip(),
-            "save_root": self.path_edit.text().strip(),
-            "save_mode": self.mode_combo.currentData(),
-            "only_images": self.only_images_cb.isChecked(),
-            "skip_duplicates": self.skip_dup_cb.isChecked(),
-            "include_replies": self.include_replies_cb.isChecked(),
-            "extract_button_link": self.extract_btn_cb.isChecked(),
-            "button_keyword": self.btn_keyword_edit.text().strip(),
-            "open_after": self.open_after_cb.isChecked(),
-            "custom_extract_json": self._adv_json_str,
-        }
-        self.start_requested.emit(params)
+        self.start_requested.emit(self._collect_task_params())
 
     def _on_preview(self):
-        self.preview_requested.emit(
-            {
-                "channel": self._get_channel_input(),  # ✨ 改用辅助方法提取
-                "tag": self.tag_edit.text().strip(),
-            }
-        )
+        self.preview_requested.emit(self._collect_task_params())
 
     def _on_save_template(self):
         """保存当前配置为模板（实际上就是保存到默认设置）"""
-        params = {
-            "save_root": self.path_edit.text().strip(),
-            "save_mode": self.mode_combo.currentData(),
-            "only_images": self.only_images_cb.isChecked(),
-            "skip_duplicates": self.skip_dup_cb.isChecked(),
-            "include_replies": self.include_replies_cb.isChecked(),
-            "extract_button_link": self.extract_btn_cb.isChecked(),
-            "button_keyword": self.btn_keyword_edit.text().strip(),
-            "open_after": self.open_after_cb.isChecked(),
-            "custom_extract_json": self._adv_json_str,
-        }
-        self.save_template_requested.emit(params)
+        self.save_template_requested.emit(self._collect_task_params())
 
     def _on_reset(self):
         """重置本次覆盖，恢复到默认设置"""
@@ -439,6 +504,7 @@ class TaskPage(ScrollPage):
         self.extract_btn_cb.setChecked(True)
         self.btn_keyword_edit.setText("原图")
         self.open_after_cb.setChecked(False)
+        self.save_ext_info_cb.setChecked(self._default_save_extended_info)
         self._adv_json_str = _default_advanced_json()
         self._adv_json_badge.setText(
             f"已启用：{DEFAULT_ADVANCED_RULE_NAME} · 已接管链接追踪"
@@ -462,12 +528,22 @@ class TaskPage(ScrollPage):
     def set_user_avatar(self, avatar_bytes: bytes):
         _set_round_avatar(self._avatar, avatar_bytes, 42)
 
-    def set_defaults(self, save_root: str, save_mode_label: str,
-                     save_mode_key: str = ""):
+    def refresh_theme(self):
+        set_theme_icon(self._notice_icon, FIF.INFO, 16)
+
+    def set_defaults(
+        self,
+        save_root: str,
+        save_mode_label: str,
+        save_mode_key: str = "",
+        save_extended_info: bool = False,
+    ):
         self._default_save_root = save_root
         self._default_mode_label = save_mode_label
         self._default_mode_key = save_mode_key
+        self._default_save_extended_info = save_extended_info
         self.path_edit.setText(save_root)
+        self.save_ext_info_cb.setChecked(save_extended_info)
         if "保存位置" in self._summary_labels:
             self._summary_labels["保存位置"].setText(save_root)
         if "保存模式" in self._summary_labels:
@@ -490,6 +566,15 @@ class TaskPage(ScrollPage):
         self.extract_btn_cb.setChecked(bool(params.get("extract_button_link", True)))
         self.btn_keyword_edit.setText(str(params.get("button_keyword", "原图")) or "原图")
         self.open_after_cb.setChecked(bool(params.get("open_after", False)))
+        self.save_ext_info_cb.setChecked(bool(params.get("save_extended_info", False)))
+        date_from = str(params.get("date_from", "") or "")
+        date_to = str(params.get("date_to", "") or "")
+        self.date_filter_cb.setChecked(bool(date_from or date_to))
+        if date_from:
+            self.start_date_edit.setDate(QDate.fromString(date_from, "yyyy-MM-dd"))
+        if date_to:
+            self.end_date_edit.setDate(QDate.fromString(date_to, "yyyy-MM-dd"))
+        self._on_date_filter_changed()
         self._adv_json_str = (
             str(params.get("custom_extract_json", "")).strip()
             or _default_advanced_json()

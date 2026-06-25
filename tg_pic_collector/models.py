@@ -70,6 +70,11 @@ class ScanRequest:
     empty_tag_action: str = "uncategorized"  # uncategorized | skip | channel
     custom_extract_json: str = ""             # 高级套娃提取规则 JSON（空字符串=不启用）
     chunk_concurrency: int = 1               # 单文件分片并发数（1=关闭分片，建议 2-8）
+    save_extended_info: bool = False
+    date_from: str = ""
+    date_to: str = ""
+
+    resume_post_ids: tuple[int, ...] = ()
 
 @dataclass(frozen=True)
 class PreviewRequest:
@@ -78,6 +83,12 @@ class PreviewRequest:
     max_posts: int
     max_results: int = 50
     thumbnails_per_post: int = 4
+    include_replies: bool = True
+    extract_button_link: bool = True
+    button_keyword: str = "原图"
+    custom_extract_json: str = ""
+    date_from: str = ""
+    date_to: str = ""
 
 
 SAVE_MODE_LABELS = {

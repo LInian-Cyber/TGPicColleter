@@ -1,5 +1,6 @@
 import asyncio
 import json
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +9,12 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, PropertyMock, patch
 
 from tg_pic_collector.config import AppConfig
+from tg_pic_collector.igp import (
+    create_igp_package,
+    default_sidecar_path,
+    embed_metadata_file,
+    write_sidecar,
+)
 from tg_pic_collector.models import PreviewRequest, ScanRequest, TelegramCredentials
 from tg_pic_collector.telegram_worker import TelegramWorker, is_image_message, safe_name
 
@@ -91,6 +98,45 @@ class TelegramWorkerHelperTests(TestCase):
                 target.read_text(encoding="utf-8"),
                 "[InternetShortcut]\nURL=https://example.com/image.jpg\n",
             )
+
+    def test_igp_package_contains_original_image_and_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            image = Path(directory) / "photo.jpg"
+            image.write_bytes(b"\xff\xd8\xff\xd9")
+            sidecar = write_sidecar(
+                image,
+                {
+                    "tags": [{"name": "cats", "source": "task", "confidence": 1.0}],
+                    "telegram": {"post_id": 42},
+                },
+            )
+
+            package = create_igp_package(image, sidecar)
+
+            with zipfile.ZipFile(package) as zf:
+                self.assertIn("manifest.json", zf.namelist())
+                self.assertIn("image/original.jpg", zf.namelist())
+                self.assertIn("metadata/igp.json", zf.namelist())
+                metadata = json.loads(zf.read("metadata/igp.json").decode("utf-8"))
+        self.assertEqual(metadata["telegram"]["post_id"], 42)
+
+    def test_png_metadata_embedding_adds_igp_itxt_chunk(self) -> None:
+        with TemporaryDirectory() as directory:
+            image = Path(directory) / "photo.png"
+            image.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\rIHDR"
+                b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+                b"\x00\x00\x00\x00"
+                b"\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+            write_sidecar(image, {"tags": [{"name": "cats"}]})
+
+            embedded = embed_metadata_file(image)
+            embedded_bytes = embedded.read_bytes()
+
+        self.assertIn(b"iTXt", embedded_bytes)
+        self.assertIn(b"IGP", embedded_bytes)
 
 
 class TelegramPreviewTests(IsolatedAsyncioTestCase):
@@ -330,6 +376,64 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(plans, [(1, 1)])
         self.assertEqual(progress[-1][:2], (1, 0))
+
+    async def test_scan_writes_extended_info_sidecar(self) -> None:
+        post = SimpleNamespace(
+            id=42,
+            message="#cats source post",
+            replies=SimpleNamespace(replies=1),
+        )
+        image = SimpleNamespace(
+            id=99,
+            message="#cute",
+            photo=SimpleNamespace(id=123),
+            document=None,
+            file=SimpleNamespace(name="photo.jpg", mime_type="image/jpeg"),
+            date=datetime(2026, 6, 10, tzinfo=timezone.utc),
+        )
+
+        class FakeClient:
+            async def get_entity(self, _):
+                return SimpleNamespace(title="Demo Channel", username="demo", id=1)
+
+            async def download_profile_photo(self, *_args, **_kwargs):
+                return b""
+
+            def iter_messages(self, _, search=None, limit=None, reply_to=None):
+                async def items():
+                    yield image if reply_to else post
+
+                return items()
+
+            async def download_media(self, _message, file):
+                Path(file).write_bytes(b"\xff\xd8\xff\xd9")
+                return file
+
+        with TemporaryDirectory() as directory:
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", Path(directory) / "session")
+            )
+            await worker._scan(
+                FakeClient(),
+                ScanRequest(
+                    "@demo",
+                    "#cats",
+                    Path(directory),
+                    "tag",
+                    max_posts=10,
+                    file_download_interval=0,
+                    save_extended_info=True,
+                ),
+            )
+            image_path = Path(directory) / "cats" / "photo.jpg"
+            sidecar = default_sidecar_path(image_path)
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["format"], "igp-sidecar")
+        self.assertEqual(payload["telegram"]["post_id"], 42)
+        self.assertEqual(payload["telegram"]["message_id"], 99)
+        self.assertEqual(payload["image"]["sha256"], "32461d5bd1773012acef0ba15636752949bd7c2ce50f9172159d9f56cf0dd9af")
+        self.assertEqual([item["name"] for item in payload["tags"]], ["cats", "cute"])
 
 
 class AppConfigTests(TestCase):

@@ -9,7 +9,7 @@ from typing import Any
 
 import qrcode
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer, Signal, QPropertyAnimation, QEasingCurve, QSize
+from PySide6.QtCore import Qt, QTimer, Signal, QPropertyAnimation, QEasingCurve, QSize, QDate
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QScrollArea,
+    QSizePolicy,
     QStyle,
     QStyledItemDelegate,
     QSystemTrayIcon,
@@ -65,6 +66,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    DateEdit,
     ScrollArea,
     DoubleSpinBox,
     SpinBox,
@@ -82,9 +84,11 @@ from qfluentwidgets import (
     HyperlinkButton,
     InfoBadge,
     MessageBoxBase,
+    MessageBox,
     PillPushButton,
     RoundMenu,
     Action,
+    isDarkTheme,
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -127,6 +131,77 @@ C_MUTED = "#68758f"
 C_BG_CARD = "transparent"
 C_BORDER = "#e8edf5"
 C_PROGRESS_BG = "#e8edf5"
+
+
+def theme_text_color() -> str:
+    return "#f5f7fb" if isDarkTheme() else "#141923"
+
+
+def theme_muted_color() -> str:
+    return "#aeb8ca" if isDarkTheme() else C_MUTED
+
+
+def theme_border_color() -> str:
+    return "#4b5260" if isDarkTheme() else C_BORDER
+
+
+def theme_surface_color() -> str:
+    return "#303238" if isDarkTheme() else "#ffffff"
+
+
+def theme_soft_bg_color() -> str:
+    return "#25282f" if isDarkTheme() else "#f6f8fc"
+
+
+def theme_progress_bg_color() -> str:
+    return "#555b66" if isDarkTheme() else C_PROGRESS_BG
+
+
+def theme_scrollbar_color(hover: bool = False) -> str:
+    if isDarkTheme():
+        return "#6d7484" if hover else "#555c6b"
+    return "#c9d3e5" if hover else "#dbe3f1"
+
+
+def theme_icon_pixmap(icon: FIF, size: int) -> QPixmap:
+    return icon.icon(Theme.AUTO).pixmap(size, size)
+
+
+def set_theme_icon(label: QLabel, icon: FIF, size: int) -> None:
+    label.setPixmap(theme_icon_pixmap(icon, size))
+
+
+def passive_table_qss() -> str:
+    text = theme_text_color()
+    border = theme_border_color()
+    scroll = theme_scrollbar_color()
+    scroll_hover = theme_scrollbar_color(True)
+    return (
+        f"QTableWidget{{border:none;background:transparent;color:{text};"
+        f"gridline-color:{border};selection-background-color:transparent;}}"
+        f"QTableWidget::item{{color:{text};background:transparent;}}"
+        f"QTableWidget::item:selected,QTableWidget::item:hover{{background:transparent;color:{text};}}"
+        f"QHeaderView::section{{background:transparent;color:{text};"
+        f"border:none;border-bottom:1px solid {border};font-weight:600;}}"
+        f"QTableCornerButton::section{{background:transparent;border:none;}}"
+        f"QScrollBar:vertical{{background:transparent;width:6px;margin:2px 0 2px 0;}}"
+        f"QScrollBar::handle:vertical{{background:{scroll};border-radius:3px;min-height:28px;}}"
+        f"QScrollBar::handle:vertical:hover{{background:{scroll_hover};}}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;background:transparent;}"
+        "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
+        f"QScrollBar:horizontal{{background:transparent;height:6px;margin:0 2px 0 2px;}}"
+        f"QScrollBar::handle:horizontal{{background:{scroll};border-radius:3px;min-width:28px;}}"
+        f"QScrollBar::handle:horizontal:hover{{background:{scroll_hover};}}"
+        "QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0;background:transparent;}"
+        "QScrollBar::add-page:horizontal,QScrollBar::sub-page:horizontal{background:transparent;}"
+    )
+
+
+def plain_text_qss() -> str:
+    return (
+        f"QPlainTextEdit{{background:{theme_soft_bg_color()};color:{theme_text_color()};"
+        f"border:1px solid {theme_border_color()};border-radius:8px;padding:8px;}}"
+    )
 
 COUNTRY_CODES = [
     ("中国", "+86"), ("中国香港", "+852"), ("中国澳门", "+853"), ("中国台湾", "+886"),
@@ -286,10 +361,16 @@ class PassiveTableWidget(QTableWidget):
         self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         # 保持 mouseTracking 开启，否则 tooltip 无法正常触发
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self.setItemDelegate(PassiveItemDelegate(self))
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        self.setStyleSheet(passive_table_qss())
 
     def mousePressEvent(self, event):
         self.clearSelection()
@@ -297,6 +378,26 @@ class PassiveTableWidget(QTableWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        event.accept()
+
+    def wheelEvent(self, event):
+        bar = self.verticalScrollBar()
+        if not bar.isVisible() or bar.maximum() <= bar.minimum():
+            event.ignore()
+            return
+
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+
+        can_scroll_up = bar.value() > bar.minimum()
+        can_scroll_down = bar.value() < bar.maximum()
+        if (delta > 0 and not can_scroll_up) or (delta < 0 and not can_scroll_down):
+            event.ignore()
+            return
+
+        super().wheelEvent(event)
         event.accept()
 
 
@@ -340,17 +441,17 @@ class ScrollPage(ScrollArea):
                      illus: str = "download-illustration.png",
                      illus_w: int = 260, illus_h: int = 100):
         card = SurfaceCard()
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row = QHBoxLayout()
         text = QVBoxLayout()
         text.setSpacing(6)
         tl = TitleLabel(title)
         text.addWidget(tl)
         text.addWidget(_muted(subtitle))
-        text.addStretch()
         row.addLayout(text, 1)
-        row.addWidget(_img_label(illus, illus_w, illus_h))
+        row.addWidget(_img_label(illus, illus_w, illus_h), 0, Qt.AlignmentFlag.AlignVCenter)
         card.body.addLayout(row)
-        self.root.addWidget(card)
+        self.root.addWidget(card, 0, Qt.AlignmentFlag.AlignTop)
 
 
 class StatCard(CardWidget):
@@ -362,9 +463,10 @@ class StatCard(CardWidget):
         top = QHBoxLayout()
         top.addWidget(StrongBodyLabel(title))
         top.addStretch()
-        ico = QLabel()
-        ico.setPixmap(icon.icon().pixmap(22, 22))
-        top.addWidget(ico)
+        self._icon = icon
+        self._icon_label = QLabel()
+        set_theme_icon(self._icon_label, icon, 22)
+        top.addWidget(self._icon_label)
         layout.addLayout(top)
         vrow = QHBoxLayout()
         self._val = TitleLabel(value)
@@ -379,6 +481,10 @@ class StatCard(CardWidget):
         self._val.setText(value)
         if detail:
             self._detail.setText(detail)
+
+    def refresh_theme(self):
+        set_theme_icon(self._icon_label, self._icon, 22)
+        self.update()
 
 
 class TrendChart(QWidget):
@@ -409,8 +515,8 @@ class TrendChart(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         area = self.rect().adjusted(46, 14, -14, -34)
-        grid_pen = QPen(QColor("#e5edf8"), 1)
-        text_pen = QPen(QColor(C_MUTED))
+        grid_pen = QPen(QColor("#59606c" if isDarkTheme() else "#e5edf8"), 1)
+        text_pen = QPen(QColor(theme_muted_color()))
         font = QFont()
         font.setPointSize(8)
         p.setFont(font)
@@ -447,12 +553,13 @@ class TrendChart(QWidget):
 
         # 数据点
         p.setBrush(QBrush(QColor(C_BLUE)))
-        p.setPen(QPen(QColor("white"), 2))
+        point_border = QColor(theme_surface_color())
+        p.setPen(QPen(point_border, 2))
         for x, y in pts:
             p.drawEllipse(x - 4, y - 4, 8, 8)
             p.setPen(text_pen)
             p.drawText(x - 6, y - 8, str(self._data[pts.index((x, y))]))
-            p.setPen(QPen(QColor("white"), 2))
+            p.setPen(QPen(point_border, 2))
         p.end()
 
 
@@ -474,7 +581,7 @@ class InlineProgress(QWidget):
         r = self.rect()
         path_bg = QPainterPath()
         path_bg.addRoundedRect(r.x(), r.y(), r.width(), r.height(), 3, 3)
-        p.fillPath(path_bg, QColor(C_PROGRESS_BG))
+        p.fillPath(path_bg, QColor(theme_progress_bg_color()))
         fill_w = int(r.width() * self._value / 100)
         if fill_w > 0:
             path_fill = QPainterPath()
@@ -509,12 +616,15 @@ class SearchPreviewDialog(MessageBoxBase):
     """Fluent-style browser for matched posts and comment image thumbnails."""
 
     cancel_requested = Signal()
+    download_requested = Signal()
 
     def __init__(self, channel: str, tag: str, parent=None):
         super().__init__(parent)
         self.widget.setMinimumSize(960, 680)
         self.widget.setMaximumSize(1120, 820)
-        self.yesButton.setText("关闭")
+        self._ready = False
+        self.yesButton.setText("直接下载")
+        self.yesButton.setEnabled(False)
         self.cancelButton.setText("取消搜索")
 
         header = QHBoxLayout()
@@ -558,7 +668,9 @@ class SearchPreviewDialog(MessageBoxBase):
 
     def set_results(self, rows: list[dict], total_count: int, display_limit: int):
         self._progress.hide()
-        self.cancelButton.hide()
+        self._ready = True
+        self.yesButton.setEnabled(bool(rows))
+        self.cancelButton.setText("关闭")
         self._clear_results()
         image_total = sum(int(row.get("image_count", 0)) for row in rows)
         hidden_count = max(0, total_count - len(rows))
@@ -616,6 +728,35 @@ class SearchPreviewDialog(MessageBoxBase):
             )
             card.body.addWidget(_muted(meta))
 
+            hit_sources = [str(item) for item in (row.get("hit_sources") or []) if item]
+            if hit_sources:
+                source_row = QHBoxLayout()
+                source_row.setSpacing(6)
+                for source in hit_sources[:6]:
+                    badge = QLabel(source)
+                    badge.setStyleSheet(
+                        f"background:#eaf1fc;color:{C_BLUE};border-radius:10px;"
+                        "padding:3px 8px;font-size:12px;font-weight:600;"
+                    )
+                    source_row.addWidget(badge)
+                source_row.addStretch()
+                card.body.addLayout(source_row)
+
+            debug_trace = [str(item) for item in (row.get("debug_trace") or []) if item]
+            if len(debug_trace) > 1:
+                trace_label = _muted("追踪链路：\n" + "\n".join(debug_trace))
+                trace_label.setVisible(False)
+                trace_btn = PushButton("查看追踪链路", icon=FIF.LINK)
+                trace_btn.setMinimumHeight(32)
+                trace_btn.clicked.connect(
+                    lambda checked=False, label=trace_label: label.setVisible(not label.isVisible())
+                )
+                trace_row = QHBoxLayout()
+                trace_row.addWidget(trace_btn)
+                trace_row.addStretch()
+                card.body.addLayout(trace_row)
+                card.body.addWidget(trace_label)
+
             thumbnails = row.get("thumbnails") or []
             if thumbnails:
                 thumb_row = QHBoxLayout()
@@ -646,7 +787,9 @@ class SearchPreviewDialog(MessageBoxBase):
 
     def set_error(self, message: str):
         self._progress.hide()
-        self.cancelButton.hide()
+        self._ready = True
+        self.yesButton.hide()
+        self.cancelButton.setText("关闭")
         self._clear_results()
         self._status.setText("搜索预览失败")
         card = SurfaceCard()
@@ -661,9 +804,59 @@ class SearchPreviewDialog(MessageBoxBase):
                 item.widget().deleteLater()
 
     def accept(self):
-        self.cancel_requested.emit()
+        if self._ready:
+            self.download_requested.emit()
+        else:
+            self.cancel_requested.emit()
         super().accept()
 
     def reject(self):
-        self.cancel_requested.emit()
+        if not self._ready:
+            self.cancel_requested.emit()
         super().reject()
+
+
+class CloseBehaviorDialog(MessageBoxBase):
+    """Ask what the title-bar close button should do this time."""
+
+    def __init__(self, remember_default: bool = False, parent=None):
+        super().__init__(parent)
+        self.yesButton.setText("确定")
+        self.cancelButton.setText("取消")
+        self.widget.setMinimumWidth(520)
+
+        self.viewLayout.addWidget(TitleLabel("点击关闭按钮时"))
+        self.viewLayout.addWidget(_muted("选择本次操作，也可以决定是否记住这个选择。"))
+
+        self._behavior_radios: dict[str, RadioButton] = {}
+        behavior_row = QHBoxLayout()
+        behavior_row.setSpacing(18)
+        for text, key in [("最小化到托盘", "minimize"), ("退出应用", "exit")]:
+            rb = RadioButton(text)
+            self._behavior_radios[key] = rb
+            behavior_row.addWidget(rb)
+        behavior_row.addStretch()
+        self._behavior_radios["minimize"].setChecked(True)
+        self.viewLayout.addLayout(behavior_row)
+
+        self.viewLayout.addWidget(_divider())
+
+        self._remember_radios: dict[bool, RadioButton] = {}
+        remember_row = QHBoxLayout()
+        remember_row.setSpacing(18)
+        for text, key in [("记住选择", True), ("仅本次", False)]:
+            rb = RadioButton(text)
+            self._remember_radios[key] = rb
+            remember_row.addWidget(rb)
+        remember_row.addStretch()
+        self._remember_radios[bool(remember_default)].setChecked(True)
+        self.viewLayout.addLayout(remember_row)
+
+    def behavior(self) -> str:
+        for key, radio in self._behavior_radios.items():
+            if radio.isChecked():
+                return key
+        return "minimize"
+
+    def remember_choice(self) -> bool:
+        return self._remember_radios[True].isChecked()

@@ -55,9 +55,9 @@ class HomePage(ScrollPage):
         # 安全提示
         shield_row = QHBoxLayout()
         shield_row.setSpacing(6)
-        shield_ico = QLabel()
-        shield_ico.setPixmap(FIF.ACCEPT.icon().pixmap(16, 16))
-        shield_row.addWidget(shield_ico)
+        self._shield_ico = QLabel()
+        set_theme_icon(self._shield_ico, FIF.ACCEPT, 16)
+        shield_row.addWidget(self._shield_ico)
         shield_row.addWidget(_muted("所有会话数据仅保存在本地，安全加密存储"))
         acct_row.addLayout(shield_row)
         acct_row.addSpacing(16)
@@ -112,10 +112,7 @@ class HomePage(ScrollPage):
         self._recent_table.setFixedHeight(190)
         self._recent_table.setShowGrid(False)
         self._recent_table.setAlternatingRowColors(False)
-        self._recent_table.setStyleSheet(
-            "QTableWidget{border:none;background:transparent;}"
-            "QTableWidget::item:selected,QTableWidget::item:hover{background:transparent;}"
-        )
+        self._recent_table.refresh_theme()
         recent_card.body.addWidget(self._recent_table)
         mid.addWidget(recent_card, 5)
 
@@ -137,11 +134,24 @@ class HomePage(ScrollPage):
         mid.addWidget(quick_card, 3)
         self.root.addLayout(mid)
 
-        # 底部三列
+        # 常用 Tag 独占一行
+        self._tags_card = SurfaceCard("常用 Tag")
+        self._tags_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._tags_grid = QGridLayout()
+        self._tags_grid.setHorizontalSpacing(8)
+        self._tags_grid.setVerticalSpacing(8)
+        self._tags_grid.setContentsMargins(0, 4, 0, 0)
+        self._tags_card.body.addLayout(self._tags_grid)
+        self.root.addWidget(self._tags_card)
+        self.set_common_tags([])
+
+        # 底部两列
         foot = QHBoxLayout()
         foot.setSpacing(14)
+        foot.setAlignment(Qt.AlignmentFlag.AlignTop)
         # 默认设置摘要
         self._summary_card = SurfaceCard("默认设置摘要")
+        self._summary_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._summary_path = _muted("默认保存目录：-")
         self._summary_mode = _muted("默认保存模式：-")
         self._summary_card.body.addWidget(self._summary_path)
@@ -150,20 +160,14 @@ class HomePage(ScrollPage):
         self._settings_btn.setMinimumHeight(36)
         self._settings_btn.clicked.connect(self.settings_requested)
         self._summary_card.body.addWidget(self._settings_btn)
-        foot.addWidget(self._summary_card, 1)
-        # 常用 Tag
-        self._tags_card = SurfaceCard("常用 Tag")
-        self._tags_row = QHBoxLayout()
-        self._tags_row.setSpacing(8)
-        self._tags_card.body.addLayout(self._tags_row)
-        foot.addWidget(self._tags_card, 1)
-        self.set_common_tags([])
+        foot.addWidget(self._summary_card, 1, Qt.AlignmentFlag.AlignTop)
         # 使用提示
         tips_card = SurfaceCard("使用提示")
+        tips_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         tips_card.body.addWidget(
             _muted("在 设置 中可配置默认行为、过滤规则与保存模式，让下载更符合您的需求。")
         )
-        foot.addWidget(tips_card, 1)
+        foot.addWidget(tips_card, 1, Qt.AlignmentFlag.AlignTop)
         self.root.addLayout(foot)
         self.root.addStretch()
 
@@ -180,6 +184,20 @@ class HomePage(ScrollPage):
 
     def set_user_avatar(self, avatar_bytes: bytes):
         _set_round_avatar(self._avatar, avatar_bytes, 50)
+
+    def refresh_theme(self):
+        set_theme_icon(self._shield_ico, FIF.ACCEPT, 16)
+        for card in (
+            self._stat_today,
+            self._stat_total,
+            self._stat_tasks,
+            self._stat_tags,
+            self._stat_disk,
+            self._stat_active,
+        ):
+            card.refresh_theme()
+        self._trend_chart.update()
+        self._recent_table.refresh_theme()
 
     def set_summary(self, save_root: str, save_mode_label: str):
         self._summary_path.setText(f"默认保存目录：{save_root}")
@@ -205,13 +223,19 @@ class HomePage(ScrollPage):
         self._trend_chart.set_data(values, labels)
 
     def set_common_tags(self, tags: list[str]):
-        while self._tags_row.count():
-            item = self._tags_row.takeAt(0)
+        while self._tags_grid.count():
+            item = self._tags_grid.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._tags_card.title_label.setText(f"常用 Tag（{len(tags)}）" if tags else "常用 Tag")
         if not tags:
-            self._tags_row.addWidget(_muted("暂无常用 Tag，完成带 Tag 的下载任务后会显示在这里。"))
+            self._tags_grid.addWidget(
+                _muted("暂无常用 Tag，完成带 Tag 的下载任务后会显示在这里。"),
+                0,
+                0,
+                1,
+                4,
+            )
         else:
             for tag in tags[:8]:
                 text = tag if tag.startswith("#") else f"#{tag}"
@@ -219,8 +243,10 @@ class HomePage(ScrollPage):
                 pill.clicked.connect(
                     lambda checked=False, value=tag: self.common_tag_requested.emit(value)
                 )
-                self._tags_row.addWidget(pill)
-        self._tags_row.addStretch()
+                index = self._tags_grid.count()
+                self._tags_grid.addWidget(pill, index // 4, index % 4)
+        for col in range(4):
+            self._tags_grid.setColumnStretch(col, 1)
 
     def set_recent_tasks(self, rows: list[dict]):
         """rows: list of {name, status, progress, time}"""

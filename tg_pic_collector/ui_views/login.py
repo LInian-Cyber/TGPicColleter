@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 from .common import *
-from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
+from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins, _set_round_avatar
 
 class LoginPage(ScrollPage):
     send_code_requested = Signal(str)          # phone
     login_requested = Signal(str, str, str)    # phone, code, password
     qr_requested = Signal()
     logout_requested = Signal()
+    account_switch_requested = Signal(str)
+    account_add_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__("loginPage", parent)
         self._qr_requested_once = False
         self._is_logged_in = False
+        self._theme_icon_labels: list[tuple[QLabel, FIF, int]] = []
         self._page_header("登录中心", "登录您的 Telegram 账号以使用全部功能",
                           illus="login-illustration.png", illus_w=200, illus_h=90)
 
@@ -20,7 +23,8 @@ class LoginPage(ScrollPage):
         self._banner = SurfaceCard()
         banner_row = QHBoxLayout()
         ico = QLabel()
-        ico.setPixmap(FIF.ACCEPT.icon().pixmap(18, 18))
+        set_theme_icon(ico, FIF.ACCEPT, 18)
+        self._theme_icon_labels.append((ico, FIF.ACCEPT, 18))
         banner_row.addWidget(ico)
         banner_row.addWidget(BodyLabel(
             "  本地会话数据安全存储在此设备中，仅用于与 Telegram 建立连接，不会上传或分享任何信息。"))
@@ -36,6 +40,9 @@ class LoginPage(ScrollPage):
         self._user_info_card = self._build_user_info_card()
         self.root.addWidget(self._user_info_card)
         self._user_info_card.hide()
+
+        self._accounts_card = self._build_account_sessions_card()
+        self.root.addWidget(self._accounts_card)
 
         # 登录表单容器（未登录时显示）
         self._login_container = QWidget()
@@ -150,7 +157,8 @@ class LoginPage(ScrollPage):
             info_layout.setContentsMargins(14, 12, 14, 12)
             ico_row = QHBoxLayout()
             ico_w = QLabel()
-            ico_w.setPixmap(icon.icon().pixmap(20, 20))
+            set_theme_icon(ico_w, icon, 20)
+            self._theme_icon_labels.append((ico_w, icon, 20))
             ico_row.addWidget(ico_w)
             ico_row.addStretch()
             info_layout.addLayout(ico_row)
@@ -176,7 +184,8 @@ class LoginPage(ScrollPage):
             fl = QHBoxLayout(feat_card)
             fl.setContentsMargins(12, 10, 12, 10)
             ico_lbl = QLabel()
-            ico_lbl.setPixmap(ico.icon().pixmap(22, 22))
+            set_theme_icon(ico_lbl, ico, 22)
+            self._theme_icon_labels.append((ico_lbl, ico, 22))
             fl.addWidget(ico_lbl)
             text_v = QVBoxLayout()
             text_v.setSpacing(2)
@@ -252,6 +261,78 @@ class LoginPage(ScrollPage):
         card.body.addLayout(btn_row)
         
         return card
+
+    def _build_account_sessions_card(self) -> SurfaceCard:
+        card = SurfaceCard("已保存账号")
+        if row := card.title_row():
+            add_btn = TransparentPushButton("添加新账号", icon=FIF.ADD)
+            add_btn.setMinimumHeight(32)
+            add_btn.clicked.connect(self.account_add_requested)
+            row.addWidget(add_btn)
+        self._accounts_list = QVBoxLayout()
+        self._accounts_list.setSpacing(8)
+        card.body.addLayout(self._accounts_list)
+        return card
+
+    def set_account_sessions(self, rows: list[dict], current_key: str = ""):
+        while self._accounts_list.count():
+            item = self._accounts_list.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not rows:
+            self._accounts_list.addWidget(
+                _muted("暂无保存账号。登录成功后会自动保存为可切换账号。")
+            )
+            return
+
+        for account in rows:
+            key = str(account.get("key", "") or "")
+            name = str(account.get("name", "") or "").strip() or "Telegram 用户"
+            phone = str(account.get("phone", "") or "").strip()
+            session_name = str(account.get("session_name", "") or "default")
+            is_current = bool(current_key and key == current_key)
+
+            row_card = CardWidget()
+            row_card.setStyleSheet("CardWidget{background:transparent;}")
+            row = QHBoxLayout(row_card)
+            row.setContentsMargins(10, 8, 10, 8)
+            row.setSpacing(12)
+
+            avatar = QLabel("●")
+            avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            avatar.setFixedSize(40, 40)
+            avatar.setObjectName("savedAccountAvatar")
+            _set_round_avatar(avatar, account.get("avatar", b""), 40)
+            row.addWidget(avatar, 0, Qt.AlignmentFlag.AlignVCenter)
+
+            text_col = QVBoxLayout()
+            text_col.setSpacing(2)
+            name_row = QHBoxLayout()
+            name_row.setSpacing(8)
+            name_row.addWidget(BodyLabel(name))
+            if is_current:
+                badge = CaptionLabel("当前")
+                badge.setStyleSheet(
+                    f"background:#eaf7f0;color:{C_GREEN};border-radius:9px;"
+                    "padding:2px 8px;font-weight:600;"
+                )
+                name_row.addWidget(badge)
+            name_row.addStretch()
+            text_col.addLayout(name_row)
+            subtitle = phone or f"本地会话：{session_name}"
+            text_col.addWidget(_muted(subtitle, wrap=False))
+            row.addLayout(text_col, 1)
+
+            switch_btn = PushButton("当前账号" if is_current else "切换")
+            switch_btn.setMinimumSize(96, 32)
+            switch_btn.setEnabled(not is_current)
+            switch_btn.clicked.connect(
+                lambda checked=False, session_key=key: self.account_switch_requested.emit(session_key)
+            )
+            row.addWidget(switch_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+            self._accounts_list.addWidget(row_card)
     
     def set_user_avatar(self, avatar_bytes: bytes):
         """设置用户头像"""
@@ -334,6 +415,9 @@ class LoginPage(ScrollPage):
 
     def set_phone(self, phone: str):
         if not phone:
+            self.phone_edit.clear()
+            self.code_edit.clear()
+            self.password_edit.clear()
             return
         for index in range(self._country_combo.count()):
             code = self._country_combo.itemData(index)
@@ -342,6 +426,10 @@ class LoginPage(ScrollPage):
                 self.phone_edit.setText(phone[len(code):])
                 return
         self.phone_edit.setText(phone)
+
+    def refresh_theme(self):
+        for label, icon, size in self._theme_icon_labels:
+            set_theme_icon(label, icon, size)
 
     def set_account(self, name: str = "", phone: str = ""):
         if name:

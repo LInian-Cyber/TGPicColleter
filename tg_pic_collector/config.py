@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
@@ -39,10 +41,14 @@ class AppConfig:
     enable_animations: bool = True
     enable_rounded_corners: bool = True
     enable_system_notifications: bool = True
+    close_behavior: str = "ask"  # ask | minimize | exit
+    remember_close_behavior: bool = False
     use_dpapi_encryption: bool = True
+    save_extended_info: bool = False
     last_task_state: dict | None = None
     channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "link": "https://t.me/xxx", "avatar_path": "..."}]
     advanced_rules: list[dict] | None = None  # [{"name": str, "description": str, "json": str}]
+    account_sessions: list[dict] | None = None  # [{"key": str, "session_name": str, "name": str, "phone": str, "avatar_path": "..."}]
 
     @property
     def config_dir(self) -> Path:
@@ -54,6 +60,16 @@ class AppConfig:
         safe_session = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", self.session_name).strip(" .")
         root = Path(self.session_dir).expanduser() if self.session_dir else self.config_dir / "sessions"
         return root / (safe_session or "default")
+
+    @staticmethod
+    def account_key(session_name: str, session_dir: str = "") -> str:
+        safe_session = (session_name or "default").strip() or "default"
+        safe_dir = str(session_dir or "").strip()
+        return f"{safe_dir}::{safe_session}"
+
+    @property
+    def current_account_key(self) -> str:
+        return self.account_key(self.session_name, self.session_dir)
 
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +110,7 @@ class AppConfig:
                     avatar_path = self._save_channel_avatar(channel_id, avatar_bytes)
                     if avatar_path:
                         item["avatar_path"] = avatar_path
+                        item["avatar_updated_at"] = datetime.now().isoformat(timespec="seconds")
                 # 最近搜索过的频道放到最前面，方便下次直接选。
                 history.insert(0, history.pop(index))
                 self.channel_history = history
@@ -111,6 +128,7 @@ class AppConfig:
             "name": channel_name,
             "link": channel_link,
             "avatar_path": avatar_path,
+            "avatar_updated_at": datetime.now().isoformat(timespec="seconds") if avatar_path else "",
         })
         self.channel_history = history[:20]  # 最多保存20个频道
         self.save()
@@ -127,20 +145,120 @@ class AppConfig:
         """保存频道头像到本地，返回相对路径"""
         if not avatar_bytes:
             return ""
-        
+
         # 创建头像缓存目录
         avatar_dir = self.config_dir / "channel_avatars"
         avatar_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 使用频道ID作为文件名（安全化）
         safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f@-]', "_", channel_id).strip(" .")
         avatar_path = avatar_dir / f"{safe_id}.jpg"
-        
+
         try:
             avatar_path.write_bytes(avatar_bytes)
             return str(avatar_path)
         except OSError:
             return ""
+
+    def add_account_session(
+        self,
+        session_name: str,
+        session_dir: str = "",
+        name: str = "",
+        phone: str = "",
+        avatar_bytes: bytes = b"",
+    ) -> None:
+        session_name = (session_name or "default").strip() or "default"
+        session_dir = str(session_dir or "").strip()
+        key = self.account_key(session_name, session_dir)
+        sessions = list(self.account_sessions or [])
+        payload = {
+            "key": key,
+            "session_name": session_name,
+            "session_dir": session_dir,
+            "name": str(name or "").strip(),
+            "phone": str(phone or "").strip(),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if avatar_bytes:
+            avatar_path = self._save_account_avatar(key, avatar_bytes)
+            if avatar_path:
+                payload["avatar_path"] = avatar_path
+                payload["avatar_updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+        for index, item in enumerate(sessions):
+            if item.get("key") == key:
+                merged = dict(item)
+                for field, value in payload.items():
+                    if value or field in {"key", "session_name", "session_dir", "updated_at"}:
+                        merged[field] = value
+                sessions.insert(0, sessions.pop(index))
+                sessions[0] = merged
+                self.account_sessions = sessions[:12]
+                self.save()
+                return
+
+        sessions.insert(0, payload)
+        self.account_sessions = sessions[:12]
+        self.save()
+
+    def remove_account_session(self, key: str) -> bool:
+        sessions = list(self.account_sessions or [])
+        kept: list[dict] = []
+        removed = False
+        for item in sessions:
+            if item.get("key") == key:
+                removed = True
+                avatar_path = item.get("avatar_path")
+                if avatar_path:
+                    try:
+                        Path(avatar_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
+            kept.append(item)
+        self.account_sessions = kept
+        if removed:
+            self.save()
+        return removed
+
+    def _save_account_avatar(self, key: str, avatar_bytes: bytes) -> str:
+        if not avatar_bytes:
+            return ""
+        avatar_dir = self.config_dir / "account_avatars"
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        avatar_path = avatar_dir / f"{digest}.jpg"
+        try:
+            avatar_path.write_bytes(avatar_bytes)
+            return str(avatar_path)
+        except OSError:
+            return ""
+
+    def get_account_sessions_with_avatars(self) -> list[dict]:
+        result: list[dict] = []
+        for item in list(self.account_sessions or []):
+            avatar_bytes = b""
+            avatar_path = item.get("avatar_path", "")
+            if avatar_path:
+                try:
+                    path = Path(avatar_path)
+                    if path.exists():
+                        avatar_bytes = path.read_bytes()
+                except OSError:
+                    pass
+            result.append(
+                {
+                    "key": item.get("key", ""),
+                    "session_name": item.get("session_name", "default"),
+                    "session_dir": item.get("session_dir", ""),
+                    "name": item.get("name", ""),
+                    "phone": item.get("phone", ""),
+                    "avatar": avatar_bytes,
+                    "updated_at": item.get("updated_at", ""),
+                }
+            )
+        return result
     
     def get_channel_history_with_avatars(self) -> list[dict]:
         """获取频道历史记录，包含头像字节数据"""

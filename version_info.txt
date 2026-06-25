@@ -1,0 +1,29 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2, 3, 1, 0),
+    prodvers=(2, 3, 1, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '080404B0',
+        [
+          StringStruct('CompanyName', 'TG Pic Collector'),
+          StringStruct('FileDescription', 'Telegram 评论区图片下载器'),
+          StringStruct('FileVersion', '2.3.1'),
+          StringStruct('InternalName', 'TG Pic Collector'),
+          StringStruct('OriginalFilename', 'TG Pic Collector.exe'),
+          StringStruct('ProductName', 'TG Pic Collector'),
+          StringStruct('ProductVersion', '2.3.1')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)

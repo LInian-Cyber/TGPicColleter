@@ -9,6 +9,15 @@ from PySide6.QtWidgets import QApplication
 from qfluentwidgets import Theme, setTheme
 
 from .config import AppConfig
+from .igp import (
+    UnsupportedMetadataFormat,
+    create_igp_package,
+    default_sidecar_path,
+    discover_sidecar_pairs,
+    embed_metadata_file,
+    image_path_from_sidecar,
+    validate_sidecar_pair,
+)
 from .logger import get_logger
 from .models import (
     PreviewRequest,
@@ -36,9 +45,12 @@ class AppController(QObject):
         self.cancelled = False
         self.queue: list[TaskRow] = []
         self._loaded_dialogs: list[dict] = []
+        self._last_preview_params: dict = {}
         self._discard_current_task = False
         self._shutting_down = False
         self._shutdown_complete = False
+        self._current_account_name = ""
+        self._current_account_phone = ""
 
         self._populate_ui()
         self._connect_ui()
@@ -53,11 +65,13 @@ class AppController(QObject):
             self.config.save_root,
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode if self.config.use_last_mode else "default",
+            self.config.save_extended_info,
         )
 
         # 加载频道历史
         channel_history = self.config.get_channel_history_with_avatars()
         self.window.task_page.add_channel_history(channel_history)
+        self.window.set_channel_cache_rows(channel_history)
 
         if self.config.channel:
             self.window.task_page.channel_combo.setText(self.config.channel)
@@ -86,7 +100,12 @@ class AppController(QObject):
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
         )
         self.window.set_settings_defaults(self._settings_dict())
+        self._refresh_account_sessions()
         self.window.set_system_notifications_enabled(self.config.enable_system_notifications)
+        self.window.set_close_behavior(
+            self.config.close_behavior,
+            self.config.remember_close_behavior,
+        )
         self.window.set_session_status(False, "等待连接 Telegram")
         self.window.set_login_phone(self.config.phone)
         self.window.apply_language(self.config.lang)
@@ -117,7 +136,10 @@ class AppController(QObject):
             "enable_animations": self.config.enable_animations,
             "enable_rounded_corners": self.config.enable_rounded_corners,
             "enable_system_notifications": self.config.enable_system_notifications,
+            "close_behavior": self.config.close_behavior,
+            "remember_close_behavior": self.config.remember_close_behavior,
             "use_dpapi_encryption": self.config.use_dpapi_encryption,
+            "save_extended_info": self.config.save_extended_info,
         }
 
     def _connect_ui(self) -> None:
@@ -128,6 +150,7 @@ class AppController(QObject):
         w.task_delete_requested.connect(self.delete_task)
         w.task_preview_requested.connect(self.start_preview)
         w.task_preview_cancel_requested.connect(self.cancel_preview)
+        w.task_preview_download_requested.connect(self.start_preview_download)
         w.task_pause_all_requested.connect(self.pause_all)
         w.task_clear_queue_requested.connect(self.clear_queue)
         w.tray_pause_requested.connect(self.pause_from_tray)
@@ -142,9 +165,17 @@ class AppController(QObject):
         w.login_requested.connect(self.sign_in)
         w.qr_requested.connect(self.start_qr_login)
         w.logout_requested.connect(self.logout)
+        w.account_switch_requested.connect(self.switch_account)
+        w.account_add_requested.connect(self.add_account)
         w.settings_save_requested.connect(self.save_settings)
         w.settings_logout_requested.connect(self.logout)
         w.settings_cache_clear_requested.connect(self.clear_cache)
+        w.settings_channel_cache_refresh_requested.connect(self.refresh_channel_cache)
+        w.settings_channel_cache_delete_requested.connect(self.delete_channel_cache)
+        w.settings_channel_cache_clear_requested.connect(self.clear_channel_cache)
+        w.close_behavior_changed.connect(self.save_close_behavior)
+        w.export_requested.connect(self.export_images)
+        w.export_open_output_requested.connect(self.open_specific_folder)
         w.open_folder_requested.connect(self.open_folder)
         w.open_log_requested.connect(self.open_log)
         w.open_log_folder_requested.connect(self.open_log_folder)
@@ -159,13 +190,140 @@ class AppController(QObject):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(path.as_uri())
 
+    @staticmethod
+    def _available_export_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        for index in range(2, 10000):
+            candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+        return path.with_name(f"{path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+
+    def _single_export_pair(self, target: Path) -> tuple[Path, Path]:
+        sidecar_image = image_path_from_sidecar(target)
+        if sidecar_image is not None:
+            image_path = sidecar_image
+            sidecar_path = target
+        else:
+            image_path = target
+            sidecar_path = default_sidecar_path(image_path)
+        validate_sidecar_pair(image_path, sidecar_path, strict_name=True)
+        return image_path, sidecar_path
+
+    def _export_text(self, zh: str, en: str) -> str:
+        return en if getattr(self.window, "_language", "zh_CN") == "en_US" else zh
+
+    def export_images(self, params: dict) -> None:
+        source_raw = str(params.get("source_path", "")).strip()
+        if not source_raw:
+            self.window.show_error("请先选择来源")
+            return
+        source_path = Path(source_raw).expanduser().resolve()
+        if not source_path.exists():
+            self.window.show_error("来源不存在")
+            return
+
+        mode = str(params.get("mode", "igp")).strip()
+        if mode not in {"igp", "metadata"}:
+            self.window.show_error("导出模式无效")
+            return
+
+        try:
+            if source_path.is_dir():
+                pairs, orphan_images, orphan_sidecars = discover_sidecar_pairs(
+                    source_path,
+                    recursive=bool(params.get("recursive", False)),
+                )
+            else:
+                pairs = [self._single_export_pair(source_path)]
+                orphan_images = 0
+                orphan_sidecars = 0
+        except (OSError, ValueError) as exc:
+            self.window.show_error(str(exc))
+            return
+
+        skipped = orphan_images + orphan_sidecars
+        if not pairs:
+            summary = self._export_text(
+                f"没有找到可导出的匹配文件。跳过不匹配 {skipped} 个。",
+                f"No matched files found. Skipped {skipped} unmatched files.",
+            )
+            self.window.set_export_result(summary, [])
+            self.window.show_error("没有找到可导出的匹配文件")
+            return
+
+        output_raw = str(params.get("output_path", "")).strip()
+        output_dir = Path(output_raw).expanduser().resolve() if output_raw else None
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        igp_options = dict(params.get("igp_options", {}) or {})
+        metadata_sections = igp_options.get("metadata_sections")
+        include_checksums = bool(igp_options.get("include_checksums", True))
+
+        rows: list[dict] = []
+        succeeded = 0
+        failed = 0
+        for image_path, sidecar_path in pairs:
+            target_dir = output_dir or image_path.parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if mode == "igp":
+                    output_path = self._available_export_path(target_dir / f"{image_path.stem}.igp")
+                    result = create_igp_package(
+                        image_path,
+                        sidecar_path,
+                        output_path,
+                        metadata_sections=metadata_sections,
+                        include_checksums=include_checksums,
+                    )
+                    mode_label = "IGP"
+                else:
+                    output_path = self._available_export_path(
+                        target_dir / f"{image_path.stem}.igpmeta{image_path.suffix}"
+                    )
+                    result = embed_metadata_file(image_path, sidecar_path, output_path)
+                    mode_label = self._export_text("元数据", "Metadata")
+                succeeded += 1
+                rows.append(
+                    {
+                        "file": image_path.name,
+                        "mode": mode_label,
+                        "status": self._export_text("成功", "Done"),
+                        "output": str(result),
+                        "message": "",
+                    }
+                )
+            except (OSError, ValueError, UnsupportedMetadataFormat) as exc:
+                failed += 1
+                rows.append(
+                    {
+                        "file": image_path.name,
+                        "mode": "IGP" if mode == "igp" else self._export_text("元数据", "Metadata"),
+                        "status": self._export_text("失败", "Failed"),
+                        "output": "",
+                        "message": str(exc),
+                    }
+                )
+
+        summary = self._export_text(
+            f"导出完成：成功 {succeeded}，失败 {failed}，跳过不匹配 {skipped}。",
+            f"Export complete: {succeeded} succeeded, {failed} failed, {skipped} unmatched skipped.",
+        )
+        self.window.set_export_result(summary, rows)
+        if failed:
+            self.window.show_info("导出完成，部分文件失败")
+        else:
+            self.window.show_success("导出完成")
+
     def clear_queue(self) -> None:
         if self.worker and self.worker.isRunning():
             self._discard_current_task = True
         self.cancel_task()  # 先停止当前任务
         self.queue.clear()
         self.window.set_task_queue(self.queue)
-        self.window.set_tray_task_state()
+        self.window.set_tray_task_state(status_text="空闲")
         self.window.show_success("任务队列已清空")
 
     def pause_all(self) -> None:
@@ -194,6 +352,51 @@ class AppController(QObject):
                     continue
         self.window.show_success(f"已清理 {count} 个缓存文件")
 
+    def refresh_channel_cache(self) -> None:
+        if self._ensure_worker(quiet=True) and self.worker and self.authorized:
+            self.worker.load_dialogs()
+            self.window.show_info("正在刷新频道缓存…")
+            return
+        self.window.set_channel_cache_rows(self._combined_channel_history(self._loaded_dialogs))
+        self.window.show_info("当前未连接 Telegram，仅显示本地频道缓存")
+
+    def delete_channel_cache(self, channel_id: str) -> None:
+        history = list(self.config.channel_history or [])
+        kept: list[dict] = []
+        removed = False
+        for item in history:
+            if str(item.get("id", "")).strip() == channel_id:
+                removed = True
+                avatar_path = item.get("avatar_path")
+                if avatar_path:
+                    try:
+                        Path(avatar_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
+            kept.append(item)
+        self.config.channel_history = kept
+        self.config.save()
+        rows = self._combined_channel_history(self._loaded_dialogs)
+        self.window.task_page.add_channel_history(rows)
+        self.window.set_channel_cache_rows(rows)
+        self.window.show_success("频道缓存已删除" if removed else "未找到该频道缓存")
+
+    def clear_channel_cache(self) -> None:
+        for item in list(self.config.channel_history or []):
+            avatar_path = item.get("avatar_path")
+            if avatar_path:
+                try:
+                    Path(avatar_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self.config.channel_history = []
+        self.config.save()
+        rows = self._combined_channel_history(self._loaded_dialogs)
+        self.window.task_page.add_channel_history(rows)
+        self.window.set_channel_cache_rows(rows)
+        self.window.show_success("频道缓存已清空")
+
     def _credentials(self) -> TelegramCredentials:
         return TelegramCredentials(
             api_id=int(self.config.api_id),
@@ -201,6 +404,94 @@ class AppController(QObject):
             phone=self.config.phone.strip(),
             session_path=self.config.session_path,
         )
+
+    def _refresh_account_sessions(self) -> None:
+        self.window.set_account_sessions(
+            self.config.get_account_sessions_with_avatars(),
+            self.config.current_account_key,
+        )
+
+    def _remember_current_account(
+        self,
+        name: str = "",
+        phone: str = "",
+        avatar_bytes: bytes = b"",
+    ) -> None:
+        self.config.add_account_session(
+            self.config.session_name,
+            self.config.session_dir,
+            name or self._current_account_name,
+            phone or self._current_account_phone,
+            avatar_bytes,
+        )
+        self._refresh_account_sessions()
+
+    def _has_active_transfer(self) -> bool:
+        return bool(
+            self.current_request
+            and self.queue
+            and self.queue[0].status in {"下载中", "已暂停", "排队中"}
+        )
+
+    def add_account(self) -> None:
+        if self._has_active_transfer():
+            self.window.show_error("请先停止当前下载任务，再切换或添加账号")
+            return
+        existing = {
+            str(item.get("session_name", "") or "")
+            for item in self.config.account_sessions or []
+            if str(item.get("session_dir", "") or "") == self.config.session_dir
+        }
+        for index in range(2, 1000):
+            session_name = f"account_{index}"
+            if session_name not in existing and session_name != self.config.session_name:
+                break
+        else:
+            session_name = f"account_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.config.session_name = session_name
+        self.config.phone = ""
+        self.config.save()
+        self.window.set_settings_defaults(self._settings_dict())
+        self.window.set_login_phone("")
+        self._restart_worker()
+        self._refresh_account_sessions()
+        self.window.navigate_to_login()
+        self.window.set_qr_message("新账号会话已创建，请刷新二维码或使用手机号登录", allow_auto_retry=True)
+        self.window.show_info("已创建新账号会话，登录成功后会自动加入账号列表")
+
+    def switch_account(self, account_key: str) -> None:
+        account_key = str(account_key or "").strip()
+        if not account_key:
+            return
+        if account_key == self.config.current_account_key:
+            self.window.show_info("当前已经是这个账号")
+            return
+        if self._has_active_transfer():
+            self.window.show_error("请先停止当前下载任务，再切换账号")
+            return
+        profile = next(
+            (
+                item
+                for item in self.config.account_sessions or []
+                if str(item.get("key", "")) == account_key
+            ),
+            None,
+        )
+        if not profile:
+            self.window.show_error("没有找到这个账号档案")
+            self._refresh_account_sessions()
+            return
+        self.config.session_name = str(profile.get("session_name", "") or "default")
+        self.config.session_dir = str(profile.get("session_dir", "") or "")
+        self.config.phone = str(profile.get("phone", "") or "")
+        self.config.save()
+        self.window.set_settings_defaults(self._settings_dict())
+        self.window.set_login_phone(self.config.phone)
+        self._restart_worker()
+        self._refresh_account_sessions()
+        self.window.navigate_to_login()
+        display = str(profile.get("name", "") or profile.get("phone", "") or self.config.session_name)
+        self.window.show_info(f"正在切换到 {display}")
 
     def _ensure_worker(self, quiet: bool = False) -> bool:
         if self.worker and self.worker.isRunning():
@@ -238,6 +529,7 @@ class AppController(QObject):
         self.worker.scan_plan_ready.connect(self._on_scan_plan_ready)
         self.worker.scan_discovery_finished.connect(self._on_scan_discovery_finished)
         self.worker.scan_progress.connect(self._on_scan_progress)
+        self.worker.scan_metrics_changed.connect(self._on_scan_metrics_changed)
         self.worker.post_status_changed.connect(self._on_post_status_changed)
         self.worker.scan_finished.connect(self._on_scan_finished)
         self.worker.scan_failed.connect(self._on_scan_failed)
@@ -258,6 +550,7 @@ class AppController(QObject):
 
     def _on_worker_ready(self, authorized: bool) -> None:
         self.window.set_session_status(authorized, "本地 Telethon Session 已加载" if authorized else "未登录")
+        self._refresh_account_sessions()
         if not authorized:
             self.window.set_account()
             self.window.set_qr_message("当前未登录，可刷新二维码或使用手机号登录")
@@ -274,8 +567,11 @@ class AppController(QObject):
 
     def _on_authorized(self, name: str, phone: str) -> None:
         self.authorized = True
+        self._current_account_name = name
+        self._current_account_phone = phone
         self.config.phone = phone
         self.config.save()
+        self._remember_current_account(name, phone)
         self.window.set_account(name, phone, "Telethon")
         self.window.set_session_status(True, "当前会话可正常使用")
         self.window.show_success(f"欢迎回来，{name}")
@@ -286,6 +582,9 @@ class AppController(QObject):
 
     def _on_user_profile_updated(self, name: str, phone: str, avatar_bytes: bytes) -> None:
         """处理用户头像更新"""
+        self._current_account_name = name or self._current_account_name
+        self._current_account_phone = phone or self._current_account_phone
+        self._remember_current_account(name, phone, avatar_bytes)
         self.window.set_user_avatar(avatar_bytes)
 
     def _on_channel_info_fetched(self, channel_id: str, channel_name: str, avatar_bytes: bytes) -> None:
@@ -295,11 +594,15 @@ class AppController(QObject):
         self.window.task_page.add_channel_history(
             self._combined_channel_history(self._loaded_dialogs)
         )
+        self.window.set_channel_cache_rows(
+            self._combined_channel_history(self._loaded_dialogs)
+        )
 
     def _on_dialogs_loaded(self, dialogs: list[dict]) -> None:
         """处理对话列表加载完成"""
         self._loaded_dialogs = dialogs
         self.window.task_page.add_channel_history(self._combined_channel_history(dialogs))
+        self.window.set_channel_cache_rows(self._combined_channel_history(dialogs))
 
     def _combined_channel_history(self, dialogs: list[dict] | None = None) -> list[dict]:
         """Merge searched channels and loaded dialogs without dropping metadata."""
@@ -351,10 +654,14 @@ class AppController(QObject):
             self.window.show_info("当前没有已连接的账号")
 
     def _on_logged_out(self) -> None:
+        self.config.remove_account_session(self.config.current_account_key)
         self.worker = None
         self.authorized = False
+        self._current_account_name = ""
+        self._current_account_phone = ""
         self.window.set_account()
         self.window.set_session_status(False, "已退出当前账号")
+        self._refresh_account_sessions()
         self.window.show_success("已退出当前账号")
 
     def start_task(self, params: dict) -> None:
@@ -374,6 +681,12 @@ class AppController(QObject):
         duplicate_mode = "skip" if params.get("skip_duplicates", True) else self.config.duplicate_mode
         if duplicate_mode == "skip" and not params.get("skip_duplicates", True):
             duplicate_mode = "rename"
+        resume_post_ids: list[int] = []
+        for item in params.get("resume_post_ids", []) or []:
+            try:
+                resume_post_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
         request = ScanRequest(
             channel=channel,
             tag=params.get("tag", ""),
@@ -394,6 +707,10 @@ class AppController(QObject):
             empty_tag_action=self.config.empty_tag_action,
             custom_extract_json=str(params.get("custom_extract_json", "")).strip(),
             chunk_concurrency=max(1, int(getattr(self.config, "chunk_concurrency", 1))),
+            save_extended_info=bool(params.get("save_extended_info", False)),
+            date_from=str(params.get("date_from", "") or ""),
+            date_to=str(params.get("date_to", "") or ""),
+            resume_post_ids=tuple(dict.fromkeys(resume_post_ids)),
         )
         self.config.channel = request.channel
         self.config.tag = request.tag
@@ -402,8 +719,16 @@ class AppController(QObject):
             "channel": request.channel,
             "tag": request.tag,
             "params": params,
+            "status": "running",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "downloaded": 0,
+            "skipped": 0,
+            "total": 0,
+            "remaining": 0,
         }
         self.config.save()
+        if not self._ensure_worker() or not self.worker:
+            return
         self.current_request = request
         self.current_open_after = bool(params.get("open_after"))
         self.cancelled = False
@@ -422,6 +747,7 @@ class AppController(QObject):
             self.config.save_root = params["save_root"]
         if params.get("save_mode") and params["save_mode"] != "default":
             self.config.save_mode = params["save_mode"]
+        self.config.save_extended_info = bool(params.get("save_extended_info", False))
         state = dict(self.config.last_task_state or {})
         state["channel"] = state.get("channel", self.config.channel)
         state["tag"] = state.get("tag", self.config.tag)
@@ -433,6 +759,7 @@ class AppController(QObject):
             self.config.save_root,
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode,
+            self.config.save_extended_info,
         )
 
     def save_advanced_rules(self, rules: list[dict]) -> None:
@@ -451,6 +778,19 @@ class AppController(QObject):
             state.get("tag", "")
         )
         self.window.task_page.restore_task_options(state.get("params", {}))
+        params = dict(state.get("params", {}) or {})
+        params["channel"] = state.get("channel") or params.get("channel", "")
+        params["tag"] = state.get("tag") or params.get("tag", "")
+        params["resume_post_ids"] = state.get("post_ids", [])
+        if not self.authorized:
+            self.window.show_info("已恢复上次任务配置；登录 Telegram 后可继续下载")
+            self.window.navigate_to_login()
+            return
+        if params.get("channel") and params.get("save_root"):
+            self.window.show_info("正在继续上次任务；已下载媒体会按缓存跳过")
+            self.start_task(params)
+        else:
+            self.window.show_info("已恢复上次任务配置，请确认频道和保存位置后开始下载")
 
     def start_preview(self, params: dict) -> None:
         channel = normalize_channel_reference(str(params.get("channel", "")))
@@ -469,14 +809,29 @@ class AppController(QObject):
         self.config.save()
         self.window.show_search_preview_loading(channel, tag)
         self.window.set_search_preview_progress("正在准备搜索…")
+        self._last_preview_params = dict(params)
+        self._last_preview_params["channel"] = channel
+        self._last_preview_params["tag"] = tag
         self.worker.start_preview(
             PreviewRequest(
                 channel=channel,
                 tag=tag,
                 max_posts=self.config.max_posts,
                 max_results=self.config.preview_max_results,
+                include_replies=bool(params.get("include_replies", True)),
+                extract_button_link=bool(params.get("extract_button_link", True)),
+                button_keyword=str(params.get("button_keyword", "")).strip() or "原图",
+                custom_extract_json=str(params.get("custom_extract_json", "")).strip(),
+                date_from=str(params.get("date_from", "") or ""),
+                date_to=str(params.get("date_to", "") or ""),
             )
         )
+
+    def start_preview_download(self) -> None:
+        if not self._last_preview_params:
+            self.window.show_info("暂无可直接下载的预览任务")
+            return
+        self.start_task(dict(self._last_preview_params))
 
     def cancel_preview(self) -> None:
         if self.worker:
@@ -545,7 +900,7 @@ class AppController(QObject):
 
     def _on_scan_started(self) -> None:
         self.window.set_task_busy(True)
-        self.window.set_tray_task_state(can_pause=True, can_stop=True)
+        self.window.set_tray_task_state(can_pause=True, can_stop=True, status_text="正在准备下载")
 
     def _on_scan_plan_ready(self, posts: int, total: int) -> None:
         if not self.queue:
@@ -574,11 +929,79 @@ class AppController(QObject):
             self.window.set_task_progress(downloaded, skipped, task.total)
             self.window.set_task_queue(self.queue)
 
+    @staticmethod
+    def _format_eta(seconds: int) -> str:
+        if seconds < 0:
+            return "计算中"
+        minutes, sec = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {sec}s"
+        return f"{sec}s"
+
+    def _update_last_task_snapshot(self, metrics: dict) -> None:
+        if not self.config.last_task_state:
+            return
+        state = dict(self.config.last_task_state)
+        state.update(
+            {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "downloaded": int(metrics.get("downloaded", 0)),
+                "skipped": int(metrics.get("skipped", 0)),
+                "total": int(metrics.get("total", 0)),
+                "remaining": int(metrics.get("remaining", 0)),
+                "queue_size": int(metrics.get("queue_size", 0)),
+                "speed": float(metrics.get("speed", 0.0)),
+            }
+        )
+        self.config.last_task_state = state
+        self.config.save()
+
+    def _on_scan_metrics_changed(self, metrics: dict) -> None:
+        downloaded = int(metrics.get("downloaded", 0))
+        skipped = int(metrics.get("skipped", 0))
+        total = int(metrics.get("total", 0))
+        completed = int(metrics.get("completed", downloaded + skipped))
+        remaining = int(metrics.get("remaining", max(0, total - completed)))
+        queue_size = int(metrics.get("queue_size", 0))
+        speed = float(metrics.get("speed", 0.0))
+        eta = self._format_eta(int(metrics.get("eta_seconds", -1)))
+        metrics_text = f"速度 {speed:.2f} 文件/秒 · 队列 {queue_size} · 剩余 {remaining} · ETA {eta}"
+
+        if self.queue:
+            task = self.queue[0]
+            task.downloaded = downloaded
+            task.skipped = skipped
+            task.total = max(task.total, total)
+            if task.total > 0:
+                task.progress = min(100, int(completed * 100 / task.total))
+            task.metrics_text = metrics_text
+            self.window.set_task_progress(downloaded, skipped, task.total)
+            self.window.set_task_queue(self.queue)
+        self.window.set_tray_task_state(
+            can_pause=True,
+            can_stop=True,
+            status_text=f"正在下载：{completed}/{total or '?'} · 队列 {queue_size}",
+        )
+        self._update_last_task_snapshot(metrics)
+
     def _on_post_status_changed(self, post_id: int, status: str) -> None:
         if not self.queue:
             return
         task = self.queue[0]
         task.post_statuses[post_id] = status
+        if self.config.last_task_state:
+            state = dict(self.config.last_task_state)
+            post_ids = list(dict.fromkeys([*state.get("post_ids", []), int(post_id)]))
+            post_statuses = dict(state.get("post_statuses", {}) or {})
+            post_statuses[str(post_id)] = status
+            state["post_ids"] = post_ids
+            state["post_statuses"] = post_statuses
+            state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.config.last_task_state = state
+            self.config.save()
         completed = sum(
             1 for value in task.post_statuses.values() if value.startswith("已完成")
         )
@@ -591,7 +1014,7 @@ class AppController(QObject):
 
     def _on_scan_finished(self, posts: int, downloaded: int, skipped: int) -> None:
         self.window.set_task_busy(False)
-        self.window.set_tray_task_state()
+        self.window.set_tray_task_state(status_text="空闲")
         status = "已取消" if self.cancelled else "已完成"
         if self.queue:
             self.queue[0].status = status
@@ -616,6 +1039,19 @@ class AppController(QObject):
         self.window.set_task_detail(
             f"{status}：匹配 {posts} 篇帖子，下载 {downloaded} 张，跳过 {skipped} 张"
         )
+        if self.config.last_task_state:
+            state = dict(self.config.last_task_state)
+            state.update(
+                {
+                    "status": status,
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "posts": posts,
+                    "downloaded": downloaded,
+                    "skipped": skipped,
+                }
+            )
+            self.config.last_task_state = state
+            self.config.save()
         if self.current_request and not self._discard_current_task:
             self.config.add_history(
                 {
@@ -632,7 +1068,7 @@ class AppController(QObject):
         if self.current_open_after and self.current_request and not self._discard_current_task:
             self.open_specific_folder(str(self.current_request.save_root))
         if not self._discard_current_task:
-            self.window.show_success(f"任务结束，新增 {downloaded} 张图片")
+            self.window.show_download_finished_actions(downloaded, skipped)
         if (
             not self._discard_current_task
             and not self.cancelled
@@ -646,7 +1082,7 @@ class AppController(QObject):
 
     def _on_scan_failed(self, message: str) -> None:
         self.window.set_task_busy(False)
-        self.window.set_tray_task_state()
+        self.window.set_tray_task_state(status_text="任务失败")
         if self.queue:
             self.queue[0].status = "已取消"
             for post_id, status in self.queue[0].post_statuses.items():
@@ -713,9 +1149,20 @@ class AppController(QObject):
         self.config.enable_system_notifications = bool(
             values.get("enable_system_notifications", True)
         )
+        self.config.close_behavior = values.get("close_behavior", self.config.close_behavior)
+        self.config.remember_close_behavior = bool(
+            values.get("remember_close_behavior", self.config.remember_close_behavior)
+        )
         self.config.use_dpapi_encryption = bool(values.get("use_dpapi_encryption", True))
+        self.config.save_extended_info = bool(
+            values.get("save_extended_info", self.config.save_extended_info)
+        )
         self.config.save()
         self.window.set_system_notifications_enabled(self.config.enable_system_notifications)
+        self.window.set_close_behavior(
+            self.config.close_behavior,
+            self.config.remember_close_behavior,
+        )
         if old_theme_mode != self.config.theme_mode:
             self._apply_theme()
         if old_lang != self.config.lang:
@@ -724,6 +1171,7 @@ class AppController(QObject):
             self.config.save_root,
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode,
+            self.config.save_extended_info,
         )
         self.window.set_task_rule_summary(
             self.config.filename_template,
@@ -738,10 +1186,19 @@ class AppController(QObject):
             self.config.save_root,
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
         )
+        self._refresh_account_sessions()
         self.window.show_success("设置已保存")
         new_credentials = (self.config.api_id, self.config.api_hash, self.config.session_name, self.config.session_dir)
         if old_credentials != new_credentials:
             self._restart_worker()
+
+    def save_close_behavior(self, behavior: str, remember: bool) -> None:
+        if behavior not in {"ask", "minimize", "exit"}:
+            return
+        self.config.close_behavior = behavior
+        self.config.remember_close_behavior = bool(remember)
+        self.config.save()
+        self.window.set_settings_defaults(self._settings_dict())
 
     def _apply_theme(self) -> None:
         theme = {"auto": Theme.AUTO, "light": Theme.LIGHT, "dark": Theme.DARK}.get(
