@@ -6,8 +6,8 @@ import os
 from ..models import normalize_channel_reference
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins, _set_round_avatar
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QCursor, QFont
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTextEdit,
     QListWidget, QListWidgetItem, QSplitter,
@@ -45,6 +45,7 @@ class TaskPage(ScrollPage):
         super().__init__("taskPage", parent)
         self._task_busy = False
         self._preview_busy = False
+        self._logged_in = False
         self._default_save_root = ""
         self._default_mode_label = ""
         self._default_mode_key = ""
@@ -288,16 +289,44 @@ class TaskPage(ScrollPage):
         self._reset_btn.clicked.connect(self._on_reset)
         for button in (self._start_btn, self._save_tpl_btn, self._reset_btn):
             button.setMinimumSize(140, 36)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._cancel_btn = PushButton("  取消任务", icon=FIF.CANCEL)
         self._cancel_btn.setMinimumSize(140, 36)  # ✨ 替换 setFixedHeight(40)
+        self._cancel_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._cancel_btn.hide()
         self._cancel_btn.clicked.connect(self.cancel_requested)
-        btn_row.addWidget(self._start_btn)
-        btn_row.addWidget(self._save_tpl_btn)
-        btn_row.addWidget(self._reset_btn)
-        btn_row.addStretch()
-        btn_row.addWidget(self._cancel_btn)
+        btn_row.setSpacing(8)
+        btn_row.addWidget(self._start_btn, 1)
+        btn_row.addWidget(self._save_tpl_btn, 1)
+        btn_row.addWidget(self._reset_btn, 1)
+        btn_row.addWidget(self._cancel_btn, 1)
         form.addLayout(btn_row, 7, 0, 1, 2)
+
+        self._action_hint_serial = 0
+        self._action_hint_enabled = False
+        self._action_hint_notice = QFrame()
+        self._action_hint_notice.setObjectName("taskActionHintNotice")
+        self._action_hint_notice.setStyleSheet(
+            "QFrame#taskActionHintNotice{background:#fffaf0;border:1px solid #ffe2a8;"
+            "border-radius:10px;}"
+        )
+        hint_row = QHBoxLayout(self._action_hint_notice)
+        hint_row.setContentsMargins(12, 8, 12, 8)
+        hint_row.setSpacing(8)
+        self._action_hint_icon = IconWidget(FIF.INFO)
+        self._action_hint_icon.setFixedSize(18, 18)
+        self._action_hint_label = BodyLabel("")
+        hint_row.addWidget(self._action_hint_icon, 0, Qt.AlignmentFlag.AlignTop)
+        hint_row.addWidget(self._action_hint_label, 1)
+        self._action_hint_notice.hide()
+        form.addWidget(self._action_hint_notice, 8, 0, 1, 2)
+
+        self._action_hint_event_widgets = (self.viewport(), self._content, form_card)
+        for widget in self._action_hint_event_widgets:
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+        QTimer.singleShot(900, lambda: setattr(self, "_action_hint_enabled", True))
+
         self._tag_empty_notice = QFrame()
         self._tag_empty_notice.setObjectName("tagEmptyNotice")
         self._tag_empty_notice.setStyleSheet(
@@ -313,7 +342,7 @@ class TaskPage(ScrollPage):
         notice_row.addWidget(_muted(
             "未填写 Tag：将从最新帖子开始按匹配数量处理，保存时使用未分类或频道名规则。"
         ), 1)
-        form.addWidget(self._tag_empty_notice, 8, 0, 1, 2)
+        form.addWidget(self._tag_empty_notice, 9, 0, 1, 2)
         self.tag_edit.textChanged.connect(self._update_tag_empty_notice)
         self._update_tag_empty_notice()
 
@@ -366,6 +395,7 @@ class TaskPage(ScrollPage):
         self._task_status_card.hide()
         self.root.addWidget(self._task_status_card)
         self.root.addStretch()
+        self._sync_action_states()
 
     def _get_channel_input(self) -> str:
         """辅助方法：智能获取频道ID"""
@@ -391,6 +421,54 @@ class TaskPage(ScrollPage):
 
     def _update_tag_empty_notice(self):
         self._tag_empty_notice.setVisible(not self.tag_edit.text().strip())
+
+    def eventFilter(self, watched, event):
+        if all(hasattr(self, name) for name in ("_start_btn", "_preview_btn")):
+            event_type = event.type()
+            if watched in getattr(self, "_action_hint_event_widgets", ()):
+                if event_type in (QEvent.Type.Enter, QEvent.Type.MouseMove):
+                    self._sync_action_hint_from_cursor()
+                elif event_type == QEvent.Type.Leave:
+                    self._hide_action_hint_later()
+        return super().eventFilter(watched, event)
+
+    def _sync_action_hint_from_cursor(self):
+        if not getattr(self, "_action_hint_enabled", False):
+            return
+        for button in (self._preview_btn, self._start_btn):
+            pos = button.mapFromGlobal(QCursor.pos())
+            if button.rect().contains(pos):
+                hint = self._action_hint_text(button)
+                if hint:
+                    self._show_action_hint(hint)
+                    return
+        self._hide_action_hint_later()
+
+    def _action_hint_text(self, watched) -> str:
+        if not self._logged_in:
+            if watched is self._preview_btn:
+                return "请先登录 Telegram 后再搜索预览。"
+            return "请先登录 Telegram 后再开始下载。"
+        if self._task_busy or self._preview_busy:
+            return "当前任务正在运行，请稍候。"
+        return ""
+
+    def _show_action_hint(self, text: str):
+        self._action_hint_serial += 1
+        serial = self._action_hint_serial
+        self._action_hint_label.setText(text)
+        self._action_hint_notice.show()
+        QTimer.singleShot(2600, lambda: self._hide_action_hint(serial))
+
+    def _hide_action_hint_later(self):
+        self._action_hint_serial += 1
+        serial = self._action_hint_serial
+        QTimer.singleShot(800, lambda: self._hide_action_hint(serial))
+
+    def _hide_action_hint(self, serial: int | None = None):
+        if serial is not None and serial != self._action_hint_serial:
+            return
+        self._action_hint_notice.hide()
 
     def _collect_task_params(self) -> dict:
         params = {
@@ -512,8 +590,9 @@ class TaskPage(ScrollPage):
 
     # ── Setters
     def set_account(self, name: str = "", phone: str = "", dc: str = ""):
-        if name:
-            self._acct_phone_label.setText(f"Telethon 用户 · {phone}")
+        self._logged_in = bool(name or phone)
+        if self._logged_in:
+            self._acct_phone_label.setText(f"Telethon 用户 · {phone}" if phone else "Telethon 用户")
             self._acct_status.setText("● 已登录")
             self._acct_status.setProperty("statusType", "success")
             self._acct_status.setStyle(self._acct_status.style())
@@ -524,6 +603,7 @@ class TaskPage(ScrollPage):
             self._acct_status.setText("● 未登录")
             self._acct_status.setProperty("statusType", "muted")
             self._acct_status.setStyle(self._acct_status.style())
+        self._sync_action_states()
 
     def set_user_avatar(self, avatar_bytes: bytes):
         _set_round_avatar(self._avatar, avatar_bytes, 42)
@@ -709,8 +789,11 @@ class TaskPage(ScrollPage):
 
     def _sync_action_states(self):
         busy = self._task_busy or self._preview_busy
-        self._start_btn.setDisabled(busy)
-        self._preview_btn.setDisabled(busy)
+        can_run = self._logged_in and not busy
+        self._start_btn.setEnabled(can_run)
+        self._preview_btn.setEnabled(can_run)
+        self._start_btn.setToolTip("")
+        self._preview_btn.setToolTip("")
 
     def set_detail(self, text: str):
         self._detail_label.setText(text)

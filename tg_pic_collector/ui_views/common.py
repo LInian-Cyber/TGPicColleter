@@ -115,6 +115,7 @@ def apply_tooltip_theme() -> None:
         background, foreground = "#252a34", "#f5f7fb"
     else:
         background, foreground = "#ffffff", "#1a2233"
+    border = "#3f4756" if isDarkTheme() else "#dbe3f1"
 
     palette = QToolTip.palette()
     palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(background))
@@ -122,6 +123,27 @@ def apply_tooltip_theme() -> None:
     palette.setColor(QPalette.ColorRole.Window, QColor(background))
     palette.setColor(QPalette.ColorRole.WindowText, QColor(foreground))
     QToolTip.setPalette(palette)
+
+    begin = "/* TGPC_TOOLTIP_BEGIN */"
+    end = "/* TGPC_TOOLTIP_END */"
+    tooltip_qss = (
+        f"{begin}\n"
+        "QToolTip{"
+        f"background-color:{background};"
+        f"color:{foreground};"
+        f"border:1px solid {border};"
+        "border-radius:6px;"
+        "padding:6px 8px;"
+        "}\n"
+        f"{end}"
+    )
+    current = app.styleSheet()
+    if begin in current and end in current:
+        before = current.split(begin, 1)[0].rstrip()
+        after = current.split(end, 1)[1].lstrip()
+        app.setStyleSheet("\n".join(part for part in (before, tooltip_qss, after) if part))
+    else:
+        app.setStyleSheet("\n".join(part for part in (current.rstrip(), tooltip_qss) if part))
 
 
 C_BLUE = "#0f6fff"
