@@ -15,6 +15,7 @@ from .home import HomePage
 from .login import LoginPage
 from .settings import SettingsPage
 from .task import TaskPage
+from .yande import YandePage
 
 class MainWindow(FluentWindow):
     """
@@ -62,6 +63,11 @@ class MainWindow(FluentWindow):
     # 导出
     export_requested = Signal(dict)
     export_open_output_requested = Signal(str)
+    # Yande
+    yande_preview_requested = Signal(dict)
+    yande_download_requested = Signal(dict)
+    yande_cancel_requested = Signal()
+    yande_open_folder_requested = Signal(str)
     # 通用
     open_folder_requested = Signal()
     open_log_requested = Signal()
@@ -81,6 +87,7 @@ class MainWindow(FluentWindow):
         self.login_page = LoginPage()
         self.history_page = HistoryPage()
         self.export_page = ExportPage()
+        self.yande_page = YandePage()
         self.settings_page = SettingsPage()
         self.about_page = AboutPage()
         self._preview_dialog: SearchPreviewDialog | None = None
@@ -109,6 +116,7 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.task_page,     FIF.DOWNLOAD, "下载任务")
         self.addSubInterface(self.login_page,    FIF.PEOPLE,   "登录中心")
         self.addSubInterface(self.history_page,  FIF.HISTORY,  "下载历史")
+        self.addSubInterface(self.yande_page,    FIF.PHOTO,    "Yande")
         self.addSubInterface(self.export_page,   FIF.SAVE,     "导出")
         self.addSubInterface(self.settings_page, FIF.SETTING,  "设置")
         self.addSubInterface(self.about_page,    FIF.INFO,     "关于")
@@ -194,6 +202,11 @@ class MainWindow(FluentWindow):
         # 导出页
         self.export_page.export_requested.connect(self.export_requested.emit)
         self.export_page.open_output_requested.connect(self.export_open_output_requested.emit)
+        # Yande 页
+        self.yande_page.preview_requested.connect(self.yande_preview_requested.emit)
+        self.yande_page.download_requested.connect(self.yande_download_requested.emit)
+        self.yande_page.cancel_requested.connect(self.yande_cancel_requested.emit)
+        self.yande_page.open_folder_requested.connect(self.yande_open_folder_requested.emit)
         # 设置页
         self.settings_page.save_requested.connect(self.settings_save_requested)
         self.settings_page.logout_requested.connect(self.settings_logout_requested)
@@ -338,6 +351,21 @@ class MainWindow(FluentWindow):
     def set_export_result(self, summary: str, rows: list[dict]):
         self.export_page.set_export_result(summary, rows)
 
+    def set_yande_defaults(self, save_root: str, cookie: str, tags: str, common_tags: list[str]):
+        self.yande_page.set_defaults(save_root, cookie, tags, common_tags)
+
+    def set_yande_busy(self, busy: bool):
+        self.yande_page.set_busy(busy)
+
+    def set_yande_rows(self, rows: list[dict]):
+        self.yande_page.set_rows(rows)
+
+    def update_yande_row(self, index: int, status: str, message: str):
+        self.yande_page.update_row(index, status, message)
+
+    def set_yande_progress(self, completed: int, total: int, message: str):
+        self.yande_page.set_progress(completed, total, message)
+
     def set_settings_defaults(self, d: dict):
         self.settings_page.set_defaults(d)
 
@@ -465,6 +493,7 @@ class MainWindow(FluentWindow):
             self.task_page,
             self.login_page,
             self.history_page,
+            self.yande_page,
             self.export_page,
             self.settings_page,
             self.about_page,
@@ -686,6 +715,7 @@ class MainWindow(FluentWindow):
             self.task_page,
             self.login_page,
             self.history_page,
+            self.yande_page,
             self.export_page,
             self.settings_page,
             self.about_page,
@@ -708,6 +738,7 @@ class MainWindow(FluentWindow):
             getattr(self, "task_page", None),
             getattr(self, "login_page", None),
             getattr(self, "history_page", None),
+            getattr(self, "yande_page", None),
             getattr(self, "export_page", None),
             getattr(self, "settings_page", None),
             getattr(self, "about_page", None),

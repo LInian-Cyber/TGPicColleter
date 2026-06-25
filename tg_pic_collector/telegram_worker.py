@@ -7,6 +7,7 @@ import queue
 import re
 import threading
 import time
+from contextlib import suppress
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -263,18 +264,23 @@ class TelegramWorker(QThread):
 
     @staticmethod
     def _shutdown_event_loop(loop: asyncio.AbstractEventLoop) -> None:
-        for _ in range(3):
+        for _ in range(6):
             pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
             if not pending:
                 break
             for task in pending:
                 task.cancel()
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.run_until_complete(asyncio.sleep(0))
-        loop.run_until_complete(loop.shutdown_asyncgens())
+            done, _ = loop.run_until_complete(asyncio.wait(pending, timeout=2))
+            for task in done:
+                with suppress(asyncio.CancelledError, Exception):
+                    task.result()
+            loop.run_until_complete(asyncio.sleep(0.05))
+        with suppress(Exception):
+            loop.run_until_complete(loop.shutdown_asyncgens())
         shutdown_executor = getattr(loop, "shutdown_default_executor", None)
         if callable(shutdown_executor):
-            loop.run_until_complete(shutdown_executor())
+            with suppress(Exception):
+                loop.run_until_complete(shutdown_executor())
 
     @staticmethod
     async def _disconnect_client(client: TelegramClient) -> None:
@@ -282,12 +288,13 @@ class TelegramWorker(QThread):
             await asyncio.wait_for(client.disconnect(), timeout=8)
             disconnected = getattr(client, "disconnected", None)
             if disconnected is not None and not disconnected.done():
-                await asyncio.wait_for(disconnected, timeout=1)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(disconnected, timeout=2)
         except asyncio.TimeoutError:
             pass
         finally:
-            for _ in range(3):
-                await asyncio.sleep(0)
+            for _ in range(8):
+                await asyncio.sleep(0.05)
 
     async def _next_command(self) -> tuple[str, Any]:
         while True:

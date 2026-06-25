@@ -11,6 +11,7 @@ from .ui_views import (
     SettingsPage,
     TaskPage,
     TaskRow,
+    YandePage,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "SettingsPage",
     "TaskPage",
     "TaskRow",
+    "YandePage",
 ]

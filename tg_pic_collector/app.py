@@ -50,5 +50,8 @@ def run() -> int:
     setThemeColor(QColor("#1677ff"))
 
     controller = AppController(config)
+    app.aboutToQuit.connect(controller.cleanup_threads)
     controller.window.show()
-    return app.exec()
+    exit_code = app.exec()
+    controller.cleanup_threads()
+    return exit_code

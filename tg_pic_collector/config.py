@@ -45,6 +45,9 @@ class AppConfig:
     remember_close_behavior: bool = False
     use_dpapi_encryption: bool = True
     save_extended_info: bool = False
+    yande_cookie: str = ""
+    yande_tags: str = ""
+    yande_tag_history: list[str] | None = None
     last_task_state: dict | None = None
     channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "link": "https://t.me/xxx", "avatar_path": "..."}]
     advanced_rules: list[dict] | None = None  # [{"name": str, "description": str, "json": str}]
@@ -83,6 +86,18 @@ class AppConfig:
         history = list(self.history or [])
         history.insert(0, record)
         self.history = history[:100]
+        self.save()
+
+    def add_yande_tag_history(self, tags: str) -> None:
+        values = [part.strip("# ") for part in re.split(r"[\s,]+", tags or "") if part.strip("# ")]
+        if not values:
+            return
+        history = list(self.yande_tag_history or [])
+        for tag in reversed(values):
+            if tag in history:
+                history.remove(tag)
+            history.insert(0, tag)
+        self.yande_tag_history = history[:30]
         self.save()
 
     def add_channel_to_history(

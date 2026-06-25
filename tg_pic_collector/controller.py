@@ -28,6 +28,7 @@ from .models import (
 )
 from .telegram_worker import TelegramWorker
 from .ui import HistoryRow, MainWindow, TaskRow
+from .yande_worker import YandeWorker
 
 
 class AppController(QObject):
@@ -39,6 +40,7 @@ class AppController(QObject):
         self.logger = get_logger()
         self.window = MainWindow()
         self.worker: TelegramWorker | None = None
+        self.yande_worker: YandeWorker | None = None
         self.authorized = False
         self.current_request: ScanRequest | None = None
         self.current_open_after = False
@@ -100,6 +102,12 @@ class AppController(QObject):
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
         )
         self.window.set_settings_defaults(self._settings_dict())
+        self.window.set_yande_defaults(
+            self.config.save_root,
+            self.config.yande_cookie,
+            self.config.yande_tags,
+            list(self.config.yande_tag_history or []),
+        )
         self._refresh_account_sessions()
         self.window.set_system_notifications_enabled(self.config.enable_system_notifications)
         self.window.set_close_behavior(
@@ -176,6 +184,10 @@ class AppController(QObject):
         w.close_behavior_changed.connect(self.save_close_behavior)
         w.export_requested.connect(self.export_images)
         w.export_open_output_requested.connect(self.open_specific_folder)
+        w.yande_preview_requested.connect(self.preview_yande)
+        w.yande_download_requested.connect(self.download_yande)
+        w.yande_cancel_requested.connect(self.cancel_yande)
+        w.yande_open_folder_requested.connect(self.open_specific_folder)
         w.open_folder_requested.connect(self.open_folder)
         w.open_log_requested.connect(self.open_log)
         w.open_log_folder_requested.connect(self.open_log_folder)
@@ -316,6 +328,123 @@ class AppController(QObject):
             self.window.show_info("导出完成，部分文件失败")
         else:
             self.window.show_success("导出完成")
+
+    def preview_yande(self, params: dict) -> None:
+        if self.yande_worker and self.yande_worker.isRunning():
+            self.window.show_info("Yande 任务正在运行，请稍候")
+            return
+        self._save_yande_params(params)
+        self.window.set_yande_busy(True)
+        self.window.set_yande_progress(0, 1, "正在从 yande.re 读取帖子…")
+        self.yande_worker = YandeWorker(params, mode="preview")
+        self.yande_worker.rows_ready.connect(self.window.set_yande_rows)
+        self.yande_worker.progress.connect(self._on_yande_progress)
+        self.yande_worker.finished.connect(lambda summary: self._on_yande_finished(summary, "preview", params))
+        self.yande_worker.failed.connect(self._on_yande_failed)
+        self.yande_worker.start()
+
+    def download_yande(self, params: dict) -> None:
+        if self.yande_worker and self.yande_worker.isRunning():
+            self.window.show_info("Yande 任务正在运行，请稍候")
+            return
+        if not str(params.get("save_root", "")).strip():
+            self.window.show_error("请先设置 Yande 保存目录")
+            return
+        rating = str(params.get("rating", "all"))
+        if rating == "explicit" and not str(params.get("cookie", "")).strip():
+            self.window.show_info("Explicit 内容通常需要 Yande 登录态 Cookie，未填写时可能没有结果")
+        self._save_yande_params(params)
+        self.window.set_yande_busy(True)
+        has_preview_rows = bool(params.get("rows"))
+        self.window.set_yande_progress(
+            0,
+            1,
+            "正在下载当前预览结果…" if has_preview_rows else "正在搜索并准备 Yande 下载…",
+        )
+        self.yande_worker = YandeWorker(params, mode="download")
+        self.yande_worker.rows_ready.connect(self.window.set_yande_rows)
+        self.yande_worker.row_updated.connect(self._on_yande_row_updated)
+        self.yande_worker.progress.connect(self._on_yande_progress)
+        self.yande_worker.finished.connect(lambda summary: self._on_yande_finished(summary, "download", params))
+        self.yande_worker.failed.connect(self._on_yande_failed)
+        self.yande_worker.start()
+
+    def cancel_yande(self) -> None:
+        if self.yande_worker and self.yande_worker.isRunning():
+            self.yande_worker.cancel()
+            self.window.set_yande_progress(0, 1, "正在停止 Yande 任务…")
+
+    def _on_yande_progress(self, completed: int, total: int, message: str) -> None:
+        self.window.set_yande_progress(completed, total, message)
+        self._refresh_log_view()
+
+    def _on_yande_row_updated(self, index: int, status: str, message: str) -> None:
+        self.window.update_yande_row(index, status, message)
+        self._refresh_log_view()
+
+    def _save_yande_params(self, params: dict) -> None:
+        tags = str(params.get("tags", "") or "").strip()
+        self.config.yande_tags = tags
+        self.config.save_root = str(params.get("save_root", self.config.save_root) or self.config.save_root)
+        current_cookie = str(params.get("cookie", "") or "").strip()
+        if bool(params.get("remember_cookie")):
+            self.config.yande_cookie = current_cookie
+        if tags:
+            self.config.add_yande_tag_history(tags)
+        else:
+            self.config.save()
+        self.window.set_yande_defaults(
+            self.config.save_root,
+            self.config.yande_cookie if bool(params.get("remember_cookie")) else current_cookie,
+            self.config.yande_tags,
+            list(self.config.yande_tag_history or []),
+        )
+
+    def _on_yande_finished(self, summary: dict, mode: str, params: dict) -> None:
+        self.window.set_yande_busy(False)
+        total = int(summary.get("total", 0) or 0)
+        downloaded = int(summary.get("downloaded", 0) or 0)
+        skipped = int(summary.get("skipped", 0) or 0)
+        failed = int(summary.get("failed", 0) or 0)
+        cancelled = bool(summary.get("cancelled"))
+        if mode == "preview":
+            self.window.set_yande_progress(total, max(1, total), f"预览完成：找到 {total} 条。")
+            self._refresh_log_view()
+            if not total:
+                self.window.show_info("Yande 没有找到匹配结果")
+            return
+
+        status = "已取消" if cancelled else ("失败" if failed and not downloaded else "已完成")
+        self.config.add_history(
+            {
+                "channel": "yande.re",
+                "tag": str(params.get("tags", "") or "未分类"),
+                "status": status,
+                "posts": total,
+                "downloaded": downloaded,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "save_root": summary.get("save_root", params.get("save_root", self.config.save_root)),
+            }
+        )
+        self._refresh_local_data()
+        self.window.set_yande_progress(
+            downloaded + skipped + failed,
+            max(1, total),
+            f"Yande 下载结束：下载 {downloaded}，跳过 {skipped}，失败 {failed}。",
+        )
+        if cancelled:
+            self.window.show_info("Yande 下载已停止")
+        elif failed:
+            self.window.show_info("Yande 下载完成，部分文件失败")
+        else:
+            self.window.show_success("Yande 下载完成")
+        self._refresh_log_view()
+
+    def _on_yande_failed(self, message: str) -> None:
+        self.window.set_yande_busy(False)
+        self.window.set_yande_progress(0, 1, f"Yande 任务失败：{message}")
+        self.window.show_error(f"Yande 任务失败：{message}")
+        self._refresh_log_view()
 
     def clear_queue(self) -> None:
         if self.worker and self.worker.isRunning():
@@ -542,7 +671,7 @@ class AppController(QObject):
     def _restart_worker(self) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.worker.wait(4000)
+            self.worker.wait(10000)
         self.worker = None
         self.authorized = False
         self.window.set_account()
@@ -1354,22 +1483,43 @@ class AppController(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        if self.yande_worker and self.yande_worker.isRunning():
+            self.yande_worker.cancel()
         if self.worker and self.worker.isRunning():
             self.worker.stop()
+        if (
+            (self.worker and self.worker.isRunning())
+            or (self.yande_worker and self.yande_worker.isRunning())
+        ):
             QTimer.singleShot(50, self._poll_shutdown)
             return
         self._finish_shutdown()
 
     def _poll_shutdown(self) -> None:
-        if self.worker and self.worker.isRunning():
+        if (
+            (self.worker and self.worker.isRunning())
+            or (self.yande_worker and self.yande_worker.isRunning())
+        ):
             QTimer.singleShot(50, self._poll_shutdown)
             return
         self._finish_shutdown()
+
+    def cleanup_threads(self) -> None:
+        """Synchronously stop background threads after the Qt loop exits."""
+        if self.yande_worker and self.yande_worker.isRunning():
+            self.yande_worker.cancel()
+            self.yande_worker.wait(5000)
+        self.yande_worker = None
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(10000)
+        self.worker = None
 
     def _finish_shutdown(self) -> None:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
+        self.yande_worker = None
         self.worker = None
         app = QApplication.instance()
         if app is not None:

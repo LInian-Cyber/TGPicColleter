@@ -9,6 +9,7 @@ from .login import LoginPage
 from .main_window import MainWindow
 from .settings import SettingsPage
 from .task import TaskPage
+from .yande import YandePage
 
 __all__ = [
     "AboutPage",
@@ -22,4 +23,5 @@ __all__ = [
     "SettingsPage",
     "TaskPage",
     "TaskRow",
+    "YandePage",
 ]
