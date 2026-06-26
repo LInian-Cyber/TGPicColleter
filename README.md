@@ -106,8 +106,8 @@ git commit -m "Prepare release"
 git branch -M main
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
-git tag v2.4
-git push origin v2.4
+git tag v2.4.1
+git push origin v2.4.1
 ```
 
 推送 `v*` 标签后，在 GitHub 的 Actions 页面可以查看四个平台的构建进度。全部完成后，工作流会自动创建对应标签的 Release，并上传四个压缩包。
@@ -127,7 +127,7 @@ git push origin v2.4
 
 ## 更新记录
 
-### v2.4
+### v2.4.1
 
 - 新增 Yande.re 页面，支持按 Tag、评分、分数、日期、Post 链接/ID 搜索预览与原图下载。
 - 支持 Yande 登录 Cookie、child post 合并、并发下载、失败重试和 `.igp.json` sidecar。
