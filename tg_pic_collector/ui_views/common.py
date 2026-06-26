@@ -9,7 +9,18 @@ from typing import Any
 
 import qrcode
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer, Signal, QPropertyAnimation, QEasingCurve, QSize, QDate
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    Signal,
+    QPropertyAnimation,
+    QEasingCurve,
+    QSize,
+    QDate,
+    QEvent,
+    QObject,
+    QPoint,
+)
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -23,6 +34,7 @@ from PySide6.QtGui import (
     QPixmap,
     QLinearGradient,
     QBrush,
+    QCursor,
 )
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -144,6 +156,183 @@ def apply_tooltip_theme() -> None:
         app.setStyleSheet("\n".join(part for part in (before, tooltip_qss, after) if part))
     else:
         app.setStyleSheet("\n".join(part for part in (current.rstrip(), tooltip_qss) if part))
+
+    # QFluentWidgets uses its own ToolTip widget for many controls, so the
+    # native QToolTip QSS above is not enough on its own.
+    try:
+        from qfluentwidgets.components.widgets.tool_tip import ToolTip
+    except Exception:
+        return
+
+    shadow = QColor(0, 0, 0, 90 if isDarkTheme() else 35)
+    fluent_qss = (
+        "ToolTip{background:transparent;border:none;}"
+        "ToolTip QFrame#container,"
+        "QFrame#container{"
+        f"background-color:{background};"
+        f"border:1px solid {border};"
+        "border-radius:8px;"
+        "}"
+        "ToolTip QLabel#contentLabel,"
+        "QLabel#contentLabel{"
+        f"color:{foreground};"
+        "background:transparent;"
+        "font-size:12px;"
+        "}"
+    )
+
+    def _set_fluent_tooltip_qss(self) -> None:
+        self.container.setObjectName("container")
+        self.label.setObjectName("contentLabel")
+        self.setStyleSheet(fluent_qss)
+        self.container.setStyleSheet(
+            "QFrame#container{"
+            f"background-color:{background};"
+            f"border:1px solid {border};"
+            "border-radius:8px;"
+            "}"
+        )
+        self.label.setStyleSheet(
+            "QLabel#contentLabel{"
+            f"color:{foreground};"
+            "background:transparent;"
+            "font-size:12px;"
+            "}"
+        )
+        if getattr(self, "shadowEffect", None):
+            self.shadowEffect.setColor(shadow)
+        self.label.adjustSize()
+        self.adjustSize()
+
+    ToolTip._ToolTip__setQss = _set_fluent_tooltip_qss
+    for widget in app.allWidgets():
+        if isinstance(widget, ToolTip):
+            _set_fluent_tooltip_qss(widget)
+
+
+class AppToolTip(QFrame):
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._label = QLabel("")
+        self._label.setWordWrap(True)
+        self._label.setMaximumWidth(620)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.addWidget(self._label)
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        if isDarkTheme():
+            background, foreground, border = "#252a34", "#f5f7fb", "#3f4756"
+        else:
+            background, foreground, border = "#ffffff", "#142033", "#dbe3f1"
+        self.setStyleSheet(
+            "QFrame{"
+            f"background:{background};border:1px solid {border};border-radius:8px;"
+            "}"
+            "QLabel{"
+            f"color:{foreground};background:transparent;border:none;font-size:12px;"
+            "}"
+        )
+
+    def show_text(self, text: str, pos: QPoint | None = None):
+        text = str(text or "").strip()
+        if not text:
+            self.hide()
+            return
+        self._label.setText(text)
+        self.adjustSize()
+        pos = pos or QCursor.pos()
+        pos = QPoint(pos.x() + 14, pos.y() + 18)
+        screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
+        if screen:
+            rect = screen.availableGeometry()
+            pos.setX(min(max(rect.left() + 6, pos.x()), rect.right() - self.width() - 6))
+            pos.setY(min(max(rect.top() + 6, pos.y()), rect.bottom() - self.height() - 6))
+        self.move(pos)
+        self.show()
+
+
+_APP_TOOLTIP: AppToolTip | None = None
+
+
+def _app_tooltip() -> AppToolTip:
+    global _APP_TOOLTIP
+    if _APP_TOOLTIP is None:
+        _APP_TOOLTIP = AppToolTip()
+    _APP_TOOLTIP.refresh_theme()
+    return _APP_TOOLTIP
+
+
+def hide_app_tooltip() -> None:
+    if _APP_TOOLTIP is not None:
+        _APP_TOOLTIP.hide()
+
+
+def show_app_tooltip(text: str, pos: QPoint | None = None, duration: int = 2400) -> None:
+    _app_tooltip().show_text(text, pos)
+    if duration > 0:
+        QTimer.singleShot(duration, hide_app_tooltip)
+
+
+def _view_tooltip_text(view: QAbstractItemView, pos: QPoint) -> str:
+    index = view.indexAt(pos)
+    if not index.isValid():
+        return ""
+    value = index.data(Qt.ItemDataRole.ToolTipRole)
+    return str(value or "").strip()
+
+
+def tooltip_text_from_event(watched: QObject, event: QEvent) -> str:
+    widget = watched if isinstance(watched, QWidget) else None
+    if widget is None:
+        return ""
+    pos = event.pos() if hasattr(event, "pos") else QPoint()
+    parent = widget
+    while parent is not None:
+        if isinstance(parent, QAbstractItemView) and parent.viewport() is widget:
+            text = _view_tooltip_text(parent, pos)
+            if text:
+                return text
+        parent = parent.parentWidget()
+    if isinstance(widget, QAbstractItemView):
+        text = _view_tooltip_text(widget, pos)
+        if text:
+            return text
+    return str(widget.toolTip() or "").strip()
+
+
+def handle_app_tooltip_event(watched: QObject, event: QEvent) -> bool:
+    try:
+        event_type = event.type()
+        tooltip_type = QEvent.Type.ToolTip
+        hide_types = {
+            QEvent.Type.Leave,
+            QEvent.Type.Hide,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.Wheel,
+        }
+    except Exception:
+        return False
+    if event_type == tooltip_type:
+        QToolTip.hideText()
+        text = tooltip_text_from_event(watched, event)
+        if text:
+            pos = event.globalPos() if hasattr(event, "globalPos") else QCursor.pos()
+            _app_tooltip().show_text(text, pos)
+        else:
+            hide_app_tooltip()
+        return True
+    if event_type in hide_types:
+        hide_app_tooltip()
+    return False
 
 
 C_BLUE = "#0f6fff"

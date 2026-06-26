@@ -1,7 +1,59 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QEvent, QPoint
+from PySide6.QtGui import QCursor
+
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
+
+
+class _TaskDetailTip(QFrame):
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._label = QLabel("")
+        self._label.setWordWrap(True)
+        self._label.setMaximumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.addWidget(self._label)
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        if isDarkTheme():
+            background, foreground, border = "#252a34", "#f5f7fb", "#3f4756"
+        else:
+            background, foreground, border = "#ffffff", "#142033", "#dbe3f1"
+        self.setStyleSheet(
+            "QFrame{"
+            f"background:{background};border:1px solid {border};border-radius:10px;"
+            "}"
+            "QLabel{"
+            f"color:{foreground};background:transparent;border:none;font-size:12px;"
+            "}"
+        )
+
+    def show_text(self, text: str):
+        if not text:
+            self.hide()
+            return
+        self._label.setText(text)
+        self.adjustSize()
+        pos = QCursor.pos() + QPoint(16, 18)
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen:
+            rect = screen.availableGeometry()
+            pos.setX(min(max(rect.left() + 6, pos.x()), rect.right() - self.width() - 6))
+            pos.setY(min(max(rect.top() + 6, pos.y()), rect.bottom() - self.height() - 6))
+        self.move(pos)
+        self.show()
+
 
 class HistoryPage(ScrollPage):
     clear_requested = Signal()
@@ -17,6 +69,8 @@ class HistoryPage(ScrollPage):
     def __init__(self, parent=None):
         super().__init__("historyPage", parent)
         self._raw_log_content = ""
+        self._active_task_tips: dict[int, str] = {}
+        self._detail_tip = _TaskDetailTip()
         self._page_header("任务与历史", "集中查看当前任务、下载记录与运行日志",
                           illus="download-illustration.png")
 
@@ -84,6 +138,8 @@ class HistoryPage(ScrollPage):
         self._queue_table.setAlternatingRowColors(False)
         self._queue_table.setMinimumHeight(300)
         self._queue_table.refresh_theme()
+        self._queue_table.viewport().setMouseTracking(True)
+        self._queue_table.viewport().installEventFilter(self)
         card.body.addWidget(self._queue_table)
         layout.addWidget(card)
         return page
@@ -170,7 +226,34 @@ class HistoryPage(ScrollPage):
             lines.append(f"……另有 {len(task.post_statuses) - 50} 条较早记录")
         return "\n".join(lines)
 
+    def _install_task_tip(self, widget: QWidget, row: int):
+        widget.setMouseTracking(True)
+        widget.setProperty("taskDetailTipRow", row)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        event_type = event.type()
+        queue_table = getattr(self, "_queue_table", None)
+        if queue_table is not None and watched is queue_table.viewport():
+            if event_type == QEvent.Type.MouseMove:
+                index = queue_table.indexAt(event.position().toPoint())
+                if index.isValid() and index.column() in (3, 4):
+                    self._detail_tip.show_text(self._active_task_tips.get(index.row(), ""))
+                else:
+                    self._detail_tip.hide()
+            elif event_type in (QEvent.Type.Leave, QEvent.Type.Hide):
+                self._detail_tip.hide()
+        row = watched.property("taskDetailTipRow") if hasattr(watched, "property") else None
+        if row is not None:
+            if event_type in (QEvent.Type.Enter, QEvent.Type.MouseMove):
+                self._detail_tip.show_text(self._active_task_tips.get(int(row), ""))
+            elif event_type in (QEvent.Type.Leave, QEvent.Type.Hide):
+                self._detail_tip.hide()
+        return super().eventFilter(watched, event)
+
     def set_active_tasks(self, tasks: list[TaskRow]):
+        self._detail_tip.hide()
+        self._active_task_tips.clear()
         self._queue_table.setUpdatesEnabled(False)
         self._queue_table.setRowCount(0)
         self._queue_count_badge.setText(str(len(tasks)))
@@ -189,18 +272,19 @@ class HistoryPage(ScrollPage):
             self._queue_table.setItem(row, 2, status_item)
 
             tooltip = self._post_tooltip(task)
+            full_tip = tooltip
             progress_widget = QWidget()
-            progress_widget.setToolTip(tooltip)
             progress_layout = QHBoxLayout(progress_widget)
             progress_layout.setContentsMargins(4, 10, 4, 10)
             bar = InlineProgress(task.progress)
-            bar.setToolTip(tooltip)
             percent = QLabel(f"{task.progress}%")
-            percent.setToolTip(tooltip)
             percent.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
             percent.setFixedWidth(36)
             progress_layout.addWidget(bar, 1)
             progress_layout.addWidget(percent)
+            self._install_task_tip(progress_widget, row)
+            self._install_task_tip(bar, row)
+            self._install_task_tip(percent, row)
             self._queue_table.setCellWidget(row, 3, progress_widget)
 
             skipped = getattr(task, "skipped", 0)
@@ -210,11 +294,11 @@ class HistoryPage(ScrollPage):
                 f"已完成 {completed} / 总数 {total_text} "
                 f"(下载 {task.downloaded} / 跳过 {skipped})"
             )
-            result_item.setToolTip(tooltip)
             metrics_text = str(getattr(task, "metrics_text", "") or "")
             if metrics_text:
                 result_item.setText(f"{result_item.text()}\n{metrics_text}")
-                result_item.setToolTip(f"{tooltip}\n{metrics_text}")
+                full_tip = f"{tooltip}\n{metrics_text}"
+            self._active_task_tips[row] = full_tip
             self._queue_table.setItem(row, 4, result_item)
 
             ops_widget = QWidget()
@@ -253,6 +337,7 @@ class HistoryPage(ScrollPage):
         self._table.refresh_theme()
         self._log_view.setStyleSheet(plain_text_qss())
         self._log_view.viewport().update()
+        self._detail_tip.refresh_theme()
 
     def _apply_log_filter(self):
         content = self._raw_log_content

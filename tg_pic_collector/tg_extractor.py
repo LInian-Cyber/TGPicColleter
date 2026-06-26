@@ -205,6 +205,9 @@ async def _scan_index_comments(
     stats: dict[str, int],
 ) -> None:
     """Scan every reached index post's comments; comment links are resources."""
+    replies = int(getattr(getattr(index_message, "replies", None), "replies", 0) or 0)
+    if replies <= 0:
+        return
     try:
         input_chat = await index_message.get_input_chat()
         async for comment in client.iter_messages(input_chat, reply_to=index_message.id):
@@ -224,6 +227,9 @@ async def _scan_index_comments(
         print(f"    🛑 扫描评论区受限，等待 {exc.seconds} 秒……")
         await asyncio.sleep(exc.seconds)
     except Exception as exc:
+        message = str(exc)
+        if "GetRepliesRequest" in message or "message ID used in the peer was invalid" in message:
+            return
         print(f"    ⚠️ 无法扫描索引帖 #{index_message.id} 评论区: {exc}")
 
 
@@ -353,18 +359,20 @@ def _media_allowed(message: types.Message, config: dict) -> bool:
     media_kind = _real_media_kind(message)
     if media_kind is None:
         return False
+    if _is_sticker_message(message):
+        return False
     if not config.get("_only_images", True):
         return True
     if media_kind == "photo":
         return True
-    mime_type = str(getattr(getattr(message, "document", None), "mime_type", "") or "")
+    mime_type = str(getattr(_message_document(message), "mime_type", "") or "")
     return mime_type.startswith("image/")
 
 
 async def _download_media(
     client: "TelegramClient", message: types.Message, save_path: str, config: dict
 ) -> bool:
-    if _real_media_kind(message) is None:
+    if _real_media_kind(message) is None or _is_sticker_message(message):
         return False
     file_info = getattr(message, "file", None)
     original_name = os.path.basename(str(getattr(file_info, "name", "") or ""))
@@ -390,6 +398,25 @@ def _real_media_kind(message: types.Message) -> str | None:
     if isinstance(media, types.MessageMediaDocument) and getattr(media, "document", None):
         return "document"
     return None
+
+
+def _message_document(message: types.Message):
+    media = getattr(message, "media", None)
+    return getattr(media, "document", None) or getattr(message, "document", None)
+
+
+def _is_sticker_message(message: types.Message) -> bool:
+    document = _message_document(message)
+    if not document:
+        return False
+    mime_type = str(getattr(document, "mime_type", "") or "").casefold()
+    attributes = getattr(document, "attributes", []) or []
+    attr_names = {type(attr).__name__ for attr in attributes}
+    if "DocumentAttributeSticker" in attr_names:
+        return True
+    if mime_type == "application/x-tgsticker":
+        return True
+    return mime_type == "video/webm" and "DocumentAttributeAnimated" in attr_names
 
 
 def _media_identity(message: types.Message) -> tuple[str, int] | None:

@@ -29,11 +29,15 @@ def _set_windows_app_identity() -> None:
         pass
 
 
-def run() -> int:
-    _set_windows_app_identity()
+def _configure_qt_runtime() -> None:
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
+
+
+def run() -> int:
+    _set_windows_app_identity()
+    _configure_qt_runtime()
     QApplication.setApplicationName(APP_NAME)
     QApplication.setApplicationDisplayName(APP_NAME)
     QApplication.setOrganizationName("TGCommentCollector")

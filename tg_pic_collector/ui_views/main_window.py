@@ -79,6 +79,7 @@ class MainWindow(FluentWindow):
     window_closing = Signal()
 
     def __init__(self):
+        self._app_tooltip_filter_ready = False
         super().__init__()
 
         # 子页面
@@ -164,6 +165,7 @@ class MainWindow(FluentWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        self._app_tooltip_filter_ready = True
 
     def _wire_internal(self):
         """连接子页面 Signal → 顶级 Signal 或页面切换（纯 UI 内部路由）"""
@@ -503,6 +505,9 @@ class MainWindow(FluentWindow):
                 set_language(lang)
 
     def eventFilter(self, watched, event):
+        if getattr(self, "_app_tooltip_filter_ready", False) and handle_app_tooltip_event(watched, event):
+            return True
+
         sidebar_grip = getattr(self, "_sidebar_resize_grip", None)
         if sidebar_grip is not None and watched is sidebar_grip:
             event_type = event.type()

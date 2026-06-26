@@ -53,6 +53,26 @@ def is_webpage_preview(message: Any) -> bool:
     return bool(media and getattr(media, "webpage", None) is not None)
 
 
+def message_document(message: Any) -> Any | None:
+    media = getattr(message, "media", None)
+    return getattr(media, "document", None) or getattr(message, "document", None)
+
+
+def is_sticker_message(message: Any) -> bool:
+    document = message_document(message)
+    if not document:
+        return False
+    mime_type = str(getattr(document, "mime_type", "") or "").casefold()
+    attributes = getattr(document, "attributes", []) or []
+    attr_names = {type(attr).__name__ for attr in attributes}
+    if "DocumentAttributeSticker" in attr_names:
+        return True
+    if mime_type == "application/x-tgsticker":
+        return True
+    # Video stickers are usually webm documents with the animated flag.
+    return mime_type == "video/webm" and "DocumentAttributeAnimated" in attr_names
+
+
 def real_media_kind(message: Any) -> str | None:
     """Identify only media actually uploaded to the Telegram message."""
     media = getattr(message, "media", None)
@@ -69,32 +89,24 @@ def real_media_kind(message: Any) -> str | None:
 
 def is_image_message(message: Any) -> bool:
     """检查消息是否为图片（排除贴纸）"""
+    if is_sticker_message(message):
+        return False
     media_kind = real_media_kind(message)
     if media_kind is None:
         return False
     if media_kind == "photo":
         return True
-    document = getattr(message, "document", None)
+    document = message_document(message)
     if not document:
         return False
 
-    mime_type = getattr(document, "mime_type", "") if document else ""
-
-    # 排除贴纸 (webp 动画贴纸)
-    attributes = getattr(document, "attributes", [])
-    for attr in attributes:
-        # 检查是否为贴纸属性
-        if type(attr).__name__ == "DocumentAttributeSticker":
-            return False
-        # 检查是否为动画贴纸
-        if type(attr).__name__ == "DocumentAttributeAnimated":
-            return False
+    mime_type = str(getattr(document, "mime_type", "") or "")
 
     return mime_type.startswith("image/")
 
 
 def is_downloadable_message(message: Any) -> bool:
-    return real_media_kind(message) is not None
+    return real_media_kind(message) is not None and not is_sticker_message(message)
 
 
 async def resolve_channel_entity(
@@ -754,9 +766,14 @@ class TelegramWorker(QThread):
             metadata_context: dict[str, Any] | None = None,
         ) -> None:
             media_key = self._media_key(message)
-            if media_key and media_key in self._downloaded_media_keys:
-                record_file(post_id, target, False, "媒体已下载过")
-                return
+            if request.skip_duplicates and media_key and media_key in self._downloaded_media_keys:
+                if target.exists():
+                    record_file(post_id, target, False, "媒体已下载过")
+                    return
+                self._downloaded_media_keys.discard(media_key)
+                self.logger.info(
+                    f"媒体索引命中但目标文件已不存在，重新下载 - 帖子 #{post_id}: {target}"
+                )
             post_pending[post_id] = post_pending.get(post_id, 0) + 1
             try:
                 await download_queue.put((post_id, message, target, media_key, metadata_context or {}))
@@ -1552,7 +1569,7 @@ class TelegramWorker(QThread):
         return bool(start and current and current < start)
 
     async def _thumbnail_bytes(self, client: TelegramClient, message: Any) -> bytes | None:
-        if is_webpage_preview(message):
+        if is_webpage_preview(message) or is_sticker_message(message):
             return None
         cache_key = self._media_key(message)
         now = time.time()
@@ -1601,7 +1618,7 @@ class TelegramWorker(QThread):
           iter_download(offset, limit) 拉取对应字节段，全部完成后
           按顺序写入磁盘，速度可提升 2-4x（受服务器限速影响）。
         """
-        if real_media_kind(message) is None:
+        if not is_downloadable_message(message):
             return False
 
         async def download() -> bool:

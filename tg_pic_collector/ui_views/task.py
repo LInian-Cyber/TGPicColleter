@@ -306,10 +306,6 @@ class TaskPage(ScrollPage):
         self._action_hint_enabled = False
         self._action_hint_notice = QFrame()
         self._action_hint_notice.setObjectName("taskActionHintNotice")
-        self._action_hint_notice.setStyleSheet(
-            "QFrame#taskActionHintNotice{background:#fffaf0;border:1px solid #ffe2a8;"
-            "border-radius:10px;}"
-        )
         hint_row = QHBoxLayout(self._action_hint_notice)
         hint_row.setContentsMargins(12, 8, 12, 8)
         hint_row.setSpacing(8)
@@ -321,7 +317,13 @@ class TaskPage(ScrollPage):
         self._action_hint_notice.hide()
         form.addWidget(self._action_hint_notice, 8, 0, 1, 2)
 
-        self._action_hint_event_widgets = (self.viewport(), self._content, form_card)
+        self._action_hint_event_widgets = (
+            self.viewport(),
+            self._content,
+            form_card,
+            self._start_btn,
+            self._preview_btn,
+        )
         for widget in self._action_hint_event_widgets:
             widget.setMouseTracking(True)
             widget.installEventFilter(self)
@@ -329,10 +331,6 @@ class TaskPage(ScrollPage):
 
         self._tag_empty_notice = QFrame()
         self._tag_empty_notice.setObjectName("tagEmptyNotice")
-        self._tag_empty_notice.setStyleSheet(
-            "QFrame#tagEmptyNotice{background:#f6f9ff;border:1px solid #dbe8ff;"
-            "border-radius:10px;}"
-        )
         notice_row = QHBoxLayout(self._tag_empty_notice)
         notice_row.setContentsMargins(12, 8, 12, 8)
         notice_row.setSpacing(8)
@@ -344,6 +342,7 @@ class TaskPage(ScrollPage):
         ), 1)
         form.addWidget(self._tag_empty_notice, 9, 0, 1, 2)
         self.tag_edit.textChanged.connect(self._update_tag_empty_notice)
+        self._apply_notice_styles()
         self._update_tag_empty_notice()
 
         form_card.body.addLayout(form)
@@ -456,8 +455,8 @@ class TaskPage(ScrollPage):
     def _show_action_hint(self, text: str):
         self._action_hint_serial += 1
         serial = self._action_hint_serial
-        self._action_hint_label.setText(text)
-        self._action_hint_notice.show()
+        self._action_hint_notice.hide()
+        show_app_tooltip(text, QCursor.pos(), duration=2600)
         QTimer.singleShot(2600, lambda: self._hide_action_hint(serial))
 
     def _hide_action_hint_later(self):
@@ -469,6 +468,7 @@ class TaskPage(ScrollPage):
         if serial is not None and serial != self._action_hint_serial:
             return
         self._action_hint_notice.hide()
+        hide_app_tooltip()
 
     def _collect_task_params(self) -> dict:
         params = {
@@ -610,6 +610,29 @@ class TaskPage(ScrollPage):
 
     def refresh_theme(self):
         set_theme_icon(self._notice_icon, FIF.INFO, 16)
+        self._apply_notice_styles()
+
+    def _apply_notice_styles(self):
+        if not hasattr(self, "_action_hint_notice") or not hasattr(self, "_tag_empty_notice"):
+            return
+        if isDarkTheme():
+            hint_bg, hint_border, hint_text = "#332a18", "#6f531b", "#f5d48a"
+            tag_bg, tag_border, tag_text = "#18243a", "#294a79", "#b8d4ff"
+        else:
+            hint_bg, hint_border, hint_text = "#fffaf0", "#ffe2a8", "#5c3b00"
+            tag_bg, tag_border, tag_text = "#f6f9ff", "#dbe8ff", "#1a3d73"
+        self._action_hint_notice.setStyleSheet(
+            "QFrame#taskActionHintNotice{"
+            f"background:{hint_bg};border:1px solid {hint_border};border-radius:10px;"
+            "}"
+        )
+        self._action_hint_label.setStyleSheet(f"color:{hint_text};")
+        self._tag_empty_notice.setStyleSheet(
+            "QFrame#tagEmptyNotice{"
+            f"background:{tag_bg};border:1px solid {tag_border};border-radius:10px;"
+            "}"
+            f"QFrame#tagEmptyNotice QLabel{{color:{tag_text};}}"
+        )
 
     def set_defaults(
         self,
@@ -794,6 +817,7 @@ class TaskPage(ScrollPage):
         self._preview_btn.setEnabled(can_run)
         self._start_btn.setToolTip("")
         self._preview_btn.setToolTip("")
+        QToolTip.hideText()
 
     def set_detail(self, text: str):
         self._detail_label.setText(text)
