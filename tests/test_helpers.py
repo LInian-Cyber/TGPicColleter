@@ -16,6 +16,12 @@ from tg_pic_collector.igp import (
     write_sidecar,
 )
 from tg_pic_collector.models import PreviewRequest, ScanRequest, TelegramCredentials
+from tg_pic_collector.network import (
+    effective_proxy_url,
+    parse_proxy_url,
+    urllib_proxy_map,
+    yande_proxy_warning,
+)
 from tg_pic_collector.telegram_worker import TelegramWorker, is_image_message, safe_name
 
 
@@ -137,6 +143,46 @@ class TelegramWorkerHelperTests(TestCase):
 
         self.assertIn(b"iTXt", embedded_bytes)
         self.assertIn(b"IGP", embedded_bytes)
+
+
+class NetworkProxyTests(TestCase):
+    def test_custom_proxy_without_scheme_defaults_to_http(self) -> None:
+        proxy = parse_proxy_url("127.0.0.1:7890", use_system_proxy=False)
+
+        self.assertIsNotNone(proxy)
+        self.assertEqual(proxy.scheme, "http")
+        self.assertEqual(proxy.host, "127.0.0.1")
+        self.assertEqual(proxy.port, 7890)
+
+    def test_telegram_prefers_socks_system_proxy(self) -> None:
+        with patch(
+            "tg_pic_collector.network.getproxies",
+            return_value={"http": "http://127.0.0.1:7890", "socks": "socks5://127.0.0.1:7891"},
+        ):
+            self.assertEqual(
+                effective_proxy_url(use_system_proxy=True, purpose="telegram"),
+                "socks5://127.0.0.1:7891",
+            )
+
+    def test_yande_prefers_http_system_proxy(self) -> None:
+        with patch(
+            "tg_pic_collector.network.getproxies",
+            return_value={"http": "http://127.0.0.1:7890", "socks": "socks5://127.0.0.1:7891"},
+        ):
+            self.assertEqual(
+                effective_proxy_url(use_system_proxy=True, purpose="http"),
+                "http://127.0.0.1:7890",
+            )
+            self.assertEqual(
+                urllib_proxy_map(use_system_proxy=True),
+                {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
+            )
+
+    def test_yande_warns_for_socks_proxy(self) -> None:
+        self.assertIn(
+            "SOCKS",
+            yande_proxy_warning("socks5://127.0.0.1:7890", use_system_proxy=False),
+        )
 
 
 class TelegramPreviewTests(IsolatedAsyncioTestCase):

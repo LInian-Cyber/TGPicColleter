@@ -23,6 +23,7 @@ from .models import (
     TelegramCredentials,
     normalize_channel_reference,
 )
+from .network import proxy_label, telethon_proxy
 
 try:
     from .crypto import decrypt_session, encrypt_session
@@ -329,16 +330,31 @@ class TelegramWorker(QThread):
         # 连接前先尝试解密 session
         decrypt_session(self.credentials.session_path)
 
+        try:
+            proxy = telethon_proxy(
+                self.credentials.proxy_url,
+                self.credentials.use_system_proxy,
+            )
+            proxy_text = proxy_label(
+                self.credentials.proxy_url,
+                self.credentials.use_system_proxy,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ConnectionError(str(exc)) from exc
+
         client = TelegramClient(
             str(self.credentials.session_path),
             self.credentials.api_id,
             self.credentials.api_hash,
+            proxy=proxy,
             timeout=10,
             connection_retries=2,
             retry_delay=1,
         )
         self._client = client
-        self.status_changed.emit("正在连接 Telegram…")
+        self.status_changed.emit(
+            "正在连接 Telegram…" if proxy is None else f"正在通过代理连接 Telegram：{proxy_text}"
+        )
         try:
             await asyncio.wait_for(client.connect(), timeout=25)
         except asyncio.TimeoutError as exc:

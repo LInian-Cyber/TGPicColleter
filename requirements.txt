@@ -1,6 +1,7 @@
 PySide6>=6.7,<7
 PySide6-Fluent-Widgets>=1.7,<2
 Telethon>=1.36,<2
+python-socks[asyncio]>=2.4,<3
 cryptg>=0.5,<1
 qrcode[pil]>=8,<9
 pywin32>=306; sys_platform == "win32"

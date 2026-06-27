@@ -54,6 +54,8 @@ class MainWindow(FluentWindow):
     account_add_requested = Signal()
     # 设置
     settings_save_requested = Signal(dict)
+    settings_network_test_requested = Signal(dict)
+    settings_data_dir_open_requested = Signal()
     settings_logout_requested = Signal()
     settings_cache_clear_requested = Signal()
     settings_channel_cache_refresh_requested = Signal()
@@ -211,6 +213,8 @@ class MainWindow(FluentWindow):
         self.yande_page.open_folder_requested.connect(self.yande_open_folder_requested.emit)
         # 设置页
         self.settings_page.save_requested.connect(self.settings_save_requested)
+        self.settings_page.network_test_requested.connect(self.settings_network_test_requested)
+        self.settings_page.data_dir_open_requested.connect(self.settings_data_dir_open_requested)
         self.settings_page.logout_requested.connect(self.settings_logout_requested)
         self.settings_page.cache_clear_requested.connect(self.settings_cache_clear_requested)
         self.settings_page.channel_cache_refresh_requested.connect(

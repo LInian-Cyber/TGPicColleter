@@ -48,6 +48,8 @@ class AppConfig:
     yande_cookie: str = ""
     yande_tags: str = ""
     yande_tag_history: list[str] | None = None
+    use_system_proxy: bool = True
+    proxy_url: str = ""
     last_task_state: dict | None = None
     channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "link": "https://t.me/xxx", "avatar_path": "..."}]
     advanced_rules: list[dict] | None = None  # [{"name": str, "description": str, "json": str}]

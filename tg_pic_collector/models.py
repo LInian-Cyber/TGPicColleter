@@ -47,6 +47,8 @@ class TelegramCredentials:
     api_hash: str
     phone: str
     session_path: Path
+    proxy_url: str = ""
+    use_system_proxy: bool = True
 
 
 @dataclass(frozen=True)

@@ -10,12 +10,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener, urlopen
 
 from PySide6.QtCore import QThread, Signal
 
 from .igp import write_sidecar
 from .logger import get_logger
+from .network import proxy_label, urllib_proxy_map, yande_proxy_warning
 
 
 YANDE_HOST = "https://yande.re"
@@ -70,6 +71,26 @@ class YandeWorker(QThread):
         self.mode = mode
         self._cancelled = False
         self.logger = get_logger()
+        self._proxy_map = {}
+        try:
+            self._proxy_map = urllib_proxy_map(
+                self.params.get("proxy_url", ""),
+                bool(self.params.get("use_system_proxy", True)),
+            )
+        except ValueError as exc:
+            self.logger.warning(f"Yande 代理配置无效，已忽略: {exc}")
+        if self._proxy_map:
+            self.logger.info(
+                "Yande 使用网络代理: "
+                f"{proxy_label(self.params.get('proxy_url', ''), bool(self.params.get('use_system_proxy', True)), 'http')}"
+            )
+        else:
+            warning = yande_proxy_warning(
+                self.params.get("proxy_url", ""),
+                bool(self.params.get("use_system_proxy", True)),
+            )
+            if warning:
+                self.logger.warning(warning)
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -203,12 +224,12 @@ class YandeWorker(QThread):
                     self.logger.warning(
                         f"Yande SSL/证书路径异常，使用兼容模式重试: {url}"
                     )
-                    return urlopen(
+                    return self._urlopen(
                         request,
                         timeout=timeout,
                         context=ssl._create_unverified_context(),
                     )
-                return urlopen(request, timeout=timeout)
+                return self._urlopen(request, timeout=timeout)
             except HTTPError:
                 raise
             except (URLError, OSError) as exc:
@@ -224,6 +245,17 @@ class YandeWorker(QThread):
                     raise
                 raise URLError(exc) from exc
         raise URLError(last_error)
+
+    def _urlopen(self, request: Request, timeout: int, context=None):
+        if not self._proxy_map:
+            if context is not None:
+                return urlopen(request, timeout=timeout, context=context)
+            return urlopen(request, timeout=timeout)
+        handlers = [ProxyHandler(self._proxy_map)]
+        if context is not None:
+            handlers.append(HTTPSHandler(context=context))
+        opener = build_opener(*handlers)
+        return opener.open(request, timeout=timeout)
 
     @staticmethod
     def _format_network_error(exc: Exception) -> str:

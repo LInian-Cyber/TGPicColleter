@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication
 from qfluentwidgets import Theme, setTheme
@@ -26,9 +26,23 @@ from .models import (
     TelegramCredentials,
     normalize_channel_reference,
 )
+from .network import run_network_diagnostics
 from .telegram_worker import TelegramWorker
 from .ui import HistoryRow, MainWindow, TaskRow
 from .yande_worker import YandeWorker
+
+
+class NetworkTestWorker(QThread):
+    result_ready = Signal(bool, str)
+
+    def __init__(self, proxy_url: str, use_system_proxy: bool, parent=None):
+        super().__init__(parent)
+        self.proxy_url = proxy_url
+        self.use_system_proxy = use_system_proxy
+
+    def run(self) -> None:
+        ok, message = run_network_diagnostics(self.proxy_url, self.use_system_proxy)
+        self.result_ready.emit(ok, message)
 
 
 class AppController(QObject):
@@ -41,6 +55,7 @@ class AppController(QObject):
         self.window = MainWindow()
         self.worker: TelegramWorker | None = None
         self.yande_worker: YandeWorker | None = None
+        self.network_test_worker: NetworkTestWorker | None = None
         self.authorized = False
         self.current_request: ScanRequest | None = None
         self.current_open_after = False
@@ -148,6 +163,8 @@ class AppController(QObject):
             "remember_close_behavior": self.config.remember_close_behavior,
             "use_dpapi_encryption": self.config.use_dpapi_encryption,
             "save_extended_info": self.config.save_extended_info,
+            "use_system_proxy": self.config.use_system_proxy,
+            "proxy_url": self.config.proxy_url,
         }
 
     def _connect_ui(self) -> None:
@@ -176,6 +193,8 @@ class AppController(QObject):
         w.account_switch_requested.connect(self.switch_account)
         w.account_add_requested.connect(self.add_account)
         w.settings_save_requested.connect(self.save_settings)
+        w.settings_network_test_requested.connect(self.test_network_proxy)
+        w.settings_data_dir_open_requested.connect(self.open_data_folder)
         w.settings_logout_requested.connect(self.logout)
         w.settings_cache_clear_requested.connect(self.clear_cache)
         w.settings_channel_cache_refresh_requested.connect(self.refresh_channel_cache)
@@ -333,6 +352,7 @@ class AppController(QObject):
         if self.yande_worker and self.yande_worker.isRunning():
             self.window.show_info("Yande 任务正在运行，请稍候")
             return
+        params = self._with_network_params(params)
         self._save_yande_params(params)
         self.window.set_yande_busy(True)
         self.window.set_yande_progress(0, 1, "正在从 yande.re 读取帖子…")
@@ -347,6 +367,7 @@ class AppController(QObject):
         if self.yande_worker and self.yande_worker.isRunning():
             self.window.show_info("Yande 任务正在运行，请稍候")
             return
+        params = self._with_network_params(params)
         if not str(params.get("save_root", "")).strip():
             self.window.show_error("请先设置 Yande 保存目录")
             return
@@ -368,6 +389,33 @@ class AppController(QObject):
         self.yande_worker.finished.connect(lambda summary: self._on_yande_finished(summary, "download", params))
         self.yande_worker.failed.connect(self._on_yande_failed)
         self.yande_worker.start()
+
+    def _with_network_params(self, params: dict) -> dict:
+        params = dict(params)
+        params["proxy_url"] = self.config.proxy_url
+        params["use_system_proxy"] = self.config.use_system_proxy
+        return params
+
+    def test_network_proxy(self, values: dict) -> None:
+        if self.network_test_worker and self.network_test_worker.isRunning():
+            self.window.show_info("网络代理测试正在运行，请稍候")
+            return
+        proxy_url = str(values.get("proxy_url", "") or "").strip()
+        use_system_proxy = bool(values.get("use_system_proxy", True))
+        self.window.show_info("正在测试网络代理…")
+        worker = NetworkTestWorker(proxy_url, use_system_proxy, self)
+        self.network_test_worker = worker
+        worker.result_ready.connect(self._on_network_test_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: setattr(self, "network_test_worker", None))
+        worker.start()
+
+    def _on_network_test_finished(self, ok: bool, message: str) -> None:
+        self.logger.info(f"网络代理测试结果: {message.replace(chr(10), ' | ')}")
+        if ok:
+            self.window.show_success(f"网络代理测试通过：{message}")
+        else:
+            self.window.show_error(f"网络代理测试未通过：{message}")
 
     def cancel_yande(self) -> None:
         if self.yande_worker and self.yande_worker.isRunning():
@@ -532,6 +580,8 @@ class AppController(QObject):
             api_hash=self.config.api_hash.strip(),
             phone=self.config.phone.strip(),
             session_path=self.config.session_path,
+            proxy_url=self.config.proxy_url,
+            use_system_proxy=self.config.use_system_proxy,
         )
 
     def _refresh_account_sessions(self) -> None:
@@ -1239,7 +1289,14 @@ class AppController(QObject):
         self._discard_current_task = False
 
     def save_settings(self, values: dict) -> None:
-        old_credentials = (self.config.api_id, self.config.api_hash, self.config.session_name, self.config.session_dir)
+        old_credentials = (
+            self.config.api_id,
+            self.config.api_hash,
+            self.config.session_name,
+            self.config.session_dir,
+            self.config.proxy_url,
+            self.config.use_system_proxy,
+        )
         old_theme_mode = self.config.theme_mode
         old_lang = self.config.lang
         mode = values.get("save_mode", self.config.save_mode)
@@ -1286,6 +1343,10 @@ class AppController(QObject):
         self.config.save_extended_info = bool(
             values.get("save_extended_info", self.config.save_extended_info)
         )
+        self.config.use_system_proxy = bool(
+            values.get("use_system_proxy", self.config.use_system_proxy)
+        )
+        self.config.proxy_url = values.get("proxy_url", self.config.proxy_url).strip()
         self.config.save()
         self.window.set_system_notifications_enabled(self.config.enable_system_notifications)
         self.window.set_close_behavior(
@@ -1317,7 +1378,14 @@ class AppController(QObject):
         )
         self._refresh_account_sessions()
         self.window.show_success("设置已保存")
-        new_credentials = (self.config.api_id, self.config.api_hash, self.config.session_name, self.config.session_dir)
+        new_credentials = (
+            self.config.api_id,
+            self.config.api_hash,
+            self.config.session_name,
+            self.config.session_dir,
+            self.config.proxy_url,
+            self.config.use_system_proxy,
+        )
         if old_credentials != new_credentials:
             self._restart_worker()
 
@@ -1364,6 +1432,11 @@ class AppController(QObject):
 
     def open_log_folder(self) -> None:
         path = self.logger.log_dir.resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(path.as_uri())
+
+    def open_data_folder(self) -> None:
+        path = self.config.config_dir.resolve()
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(path.as_uri())
 

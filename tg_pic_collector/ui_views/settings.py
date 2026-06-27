@@ -3,11 +3,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from ..network import proxy_label, yande_proxy_warning
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
 
 class SettingsPage(ScrollPage):
     save_requested = Signal(dict)   # emit settings dict
+    network_test_requested = Signal(dict)
+    data_dir_open_requested = Signal()
     logout_requested = Signal()
     cache_clear_requested = Signal()
     language_preview_requested = Signal(str)
@@ -397,6 +400,42 @@ class SettingsPage(ScrollPage):
         )
         api_card.body.addWidget(_muted(encryption_note))
 
+        proxy_card = SurfaceCard("网络代理", "用于 Telegram 连接和 Yande 网络请求，避免必须开启网卡/TUN 全局代理。")
+        proxy_row = QHBoxLayout()
+        proxy_text = QVBoxLayout()
+        proxy_text.setSpacing(2)
+        proxy_text.addWidget(StrongBodyLabel("自动读取系统代理"))
+        proxy_text.addWidget(_muted("开启后会读取系统或环境变量中的 HTTP/HTTPS/ALL_PROXY。"))
+        proxy_row.addLayout(proxy_text, 1)
+        self.use_system_proxy_sw = SwitchButton()
+        self.use_system_proxy_sw.setChecked(True)
+        proxy_row.addWidget(self.use_system_proxy_sw)
+        proxy_card.body.addLayout(proxy_row)
+
+        proxy_card.body.addWidget(StrongBodyLabel("自定义代理地址（可选）"))
+        self.proxy_url_edit = LineEdit()
+        self.proxy_url_edit.setPlaceholderText("例如：http://127.0.0.1:7890 或 socks5://127.0.0.1:7890")
+        proxy_card.body.addWidget(self.proxy_url_edit)
+        proxy_card.body.addWidget(_muted(
+            "Telegram 支持 HTTP/SOCKS 代理；Yande 下载建议填写 HTTP 或 mixed 端口。"
+        ))
+        self._proxy_preview_lbl = _muted("")
+        proxy_card.body.addWidget(self._proxy_preview_lbl)
+        proxy_actions = QHBoxLayout()
+        proxy_actions.addStretch()
+        test_proxy_btn = PushButton("测试网络代理", icon=FIF.SYNC)
+        test_proxy_btn.setMinimumHeight(36)
+        test_proxy_btn.clicked.connect(lambda: self.network_test_requested.emit(self._collect()))
+        proxy_actions.addWidget(test_proxy_btn)
+        proxy_card.body.addLayout(proxy_actions)
+        self.proxy_url_edit.textChanged.connect(self._update_proxy_preview)
+        try:
+            self.use_system_proxy_sw.checkedChanged.connect(self._update_proxy_preview)
+        except AttributeError:
+            self.use_system_proxy_sw.toggled.connect(self._update_proxy_preview)
+        self._update_proxy_preview()
+        api_card.body.addWidget(proxy_card)
+
         ops_row = QHBoxLayout()
 
         logout_btn = PushButton("登出当前账号", icon=FIF.POWER_BUTTON)
@@ -405,13 +444,17 @@ class SettingsPage(ScrollPage):
         cache_btn = PushButton("清理缓存", icon=FIF.DELETE)
         cache_btn.clicked.connect(self.cache_clear_requested)
 
+        data_dir_btn = PushButton("打开本地数据目录", icon=FIF.FOLDER)
+        data_dir_btn.clicked.connect(self.data_dir_open_requested)
+
         # ✨ 1. 统一将两个按钮的尺寸设置为相同的最小宽高（宽 140，高 36）
         # ✨ 2. 删除了原有的 setStyleSheet("color:#e53935;")，恢复原生的高级质感与交互反馈
-        for button in (logout_btn, cache_btn):
+        for button in (logout_btn, cache_btn, data_dir_btn):
             button.setMinimumSize(140, 36)
 
         ops_row.addWidget(logout_btn)
         ops_row.addWidget(cache_btn)
+        ops_row.addWidget(data_dir_btn)
         ops_row.addStretch()
         api_card.body.addLayout(ops_row)
         grid.addWidget(api_card, 0, 0, 1, 2)
@@ -429,6 +472,9 @@ class SettingsPage(ScrollPage):
         ]:
             guide_card.body.addWidget(_muted(step))
         guide_card.body.addWidget(_divider())
+        guide_card.body.addWidget(_muted(
+            "申请 API ID / API Hash 时请使用家宽或手机流量等真实网络；代理、机房或机场节点可能无法创建应用。"
+        ))
         guide_card.body.addWidget(_muted("API Hash 相当于应用密钥，请勿发送给他人。"))
         api_link = HyperlinkButton(
             "https://my.telegram.org/apps",
@@ -568,6 +614,22 @@ class SettingsPage(ScrollPage):
         if d:
             self.session_path_edit.setText(d)
 
+    def _update_proxy_preview(self, *_):
+        if not hasattr(self, "_proxy_preview_lbl"):
+            return
+        proxy_url = self.proxy_url_edit.text().strip()
+        use_system = self.use_system_proxy_sw.isChecked()
+        try:
+            telegram = proxy_label(proxy_url, use_system, "telegram")
+            yande = proxy_label(proxy_url, use_system, "http")
+            warning = yande_proxy_warning(proxy_url, use_system)
+            text = f"当前实际代理：Telegram {telegram}；Yande {yande}"
+            if warning:
+                text += f"\n{warning}"
+        except ValueError as exc:
+            text = f"代理配置有误：{exc}"
+        self._proxy_preview_lbl.setText(text)
+
     def _on_save(self):
         self.save_requested.emit(self._collect())
 
@@ -605,6 +667,8 @@ class SettingsPage(ScrollPage):
         self.notification_sw.setChecked(True)
         self._close_behavior_radios["ask"].setChecked(True)
         self._close_remember_radios[False].setChecked(True)
+        self.use_system_proxy_sw.setChecked(True)
+        self.proxy_url_edit.clear()
 
     def _collect(self) -> dict:
         mode = self.mode_combo.currentData() or "channel_tag"
@@ -635,6 +699,8 @@ class SettingsPage(ScrollPage):
             "api_hash": self.api_hash_edit.text().strip(),
             "session_name": self.session_edit.text().strip() or "default",
             "session_path": self.session_path_edit.text().strip(),
+            "use_system_proxy": self.use_system_proxy_sw.isChecked(),
+            "proxy_url": self.proxy_url_edit.text().strip(),
             "theme_mode": theme,
             "lang": self.lang_combo.currentData() or "zh_CN",
             "open_after_download": self.auto_open_sw.isChecked(),
@@ -659,6 +725,11 @@ class SettingsPage(ScrollPage):
             self.session_edit.setText(d["session_name"])
         if "session_path" in d:
             self.session_path_edit.setText(str(d["session_path"]))
+        if "use_system_proxy" in d:
+            self.use_system_proxy_sw.setChecked(bool(d["use_system_proxy"]))
+        if "proxy_url" in d:
+            self.proxy_url_edit.setText(str(d["proxy_url"] or ""))
+        self._update_proxy_preview()
         if "theme_mode" in d:
             rb = self._theme_radios.get(d["theme_mode"])
             if rb:

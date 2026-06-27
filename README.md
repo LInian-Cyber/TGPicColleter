@@ -106,8 +106,8 @@ git commit -m "Prepare release"
 git branch -M main
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
-git tag v2.4.1
-git push origin v2.4.1
+git tag v2.4.2
+git push origin v2.4.2
 ```
 
 推送 `v*` 标签后，在 GitHub 的 Actions 页面可以查看四个平台的构建进度。全部完成后，工作流会自动创建对应标签的 Release，并上传四个压缩包。
@@ -126,6 +126,15 @@ git push origin v2.4.1
 贡献代码将按本项目许可证发布。
 
 ## 更新记录
+
+### v2.4.2
+
+- 增加应用级网络代理配置，支持自动读取系统代理和手动填写 HTTP/SOCKS 代理。
+- Telegram 连接接入代理配置，避免必须依赖网卡/TUN 全局代理。
+- Yande 网络请求接入 HTTP/HTTPS 代理，并在 SOCKS 代理无法生效时给出明确提示。
+- 设置页增加代理实际生效预览、网络代理测试和本地数据目录快捷入口。
+- 申请 Telegram API ID / API Hash 的说明中增加家宽或手机流量提示，降低代理/机房节点导致创建失败的困扰。
+- 增加代理解析与选择策略测试，覆盖 HTTP、SOCKS、系统代理优先级和 Yande 代理提示。
 
 ### v2.4.1
 
