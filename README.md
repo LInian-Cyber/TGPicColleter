@@ -106,8 +106,8 @@ git commit -m "Prepare release"
 git branch -M main
 git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
-git tag v2.4.2
-git push origin v2.4.2
+git tag v2.4.3
+git push origin v2.4.3
 ```
 
 推送 `v*` 标签后，在 GitHub 的 Actions 页面可以查看四个平台的构建进度。全部完成后，工作流会自动创建对应标签的 Release，并上传四个压缩包。
@@ -126,6 +126,20 @@ git push origin v2.4.2
 贡献代码将按本项目许可证发布。
 
 ## 更新记录
+
+### v2.4.3
+
+- 优化 Telegram 分片下载，改为临时分片落盘、合并后原子替换，降低大文件内存占用。
+- 修复 Telegram 分片下载参数计算，避免 `iter_download limit` 误按字节数使用。
+- 升级 Telegram 媒体去重索引，记录已保存路径，避免跨帖子、跨目录和同任务内重复下载。
+- 新增 Telegram 单文件分片数设置，并在任务页摘要展示分片数与空 Tag 处理规则。
+- 支持从 Telegram 按钮识别原图链接，并兼容 `telegram.me` 帖子链接。
+- 修复 Tag 为空时跳过、保存模板默认项、继续上次任务和任务失败状态同步逻辑。
+- 历史记录增加按条打开保存目录，Telegram 历史记录保存当时的 `save_root`。
+- 改进配置与媒体索引写入流程，使用临时文件原子替换降低损坏风险。
+- 增强 Windows 文件名安全处理，避开 `CON`、`NUL`、`COM1` 等保留设备名。
+- 优化 Yande 预览缓存、日期范围纠正、Post 链接识别和文件名安全处理。
+- 补充下载分片、媒体去重、恢复任务、配置保存、Yande 解析和 Windows 保留名相关测试。
 
 ### v2.4.2
 

@@ -50,6 +50,9 @@ class TaskPage(ScrollPage):
         self._default_mode_label = ""
         self._default_mode_key = ""
         self._default_save_extended_info = False
+        self._default_open_after = False
+        self._default_skip_duplicates = True
+        self._default_empty_tag_action = "uncategorized"
         self._channel_list = []  # 存储频道列表
         self._custom_advanced_rules: list[dict] = []
         self._page_header("新建下载任务",
@@ -337,9 +340,10 @@ class TaskPage(ScrollPage):
         notice_icon = IconWidget(FIF.INFO)
         notice_icon.setFixedSize(18, 18)
         notice_row.addWidget(notice_icon, 0, Qt.AlignmentFlag.AlignTop)
-        notice_row.addWidget(_muted(
+        self._tag_empty_notice_label = _muted(
             "未填写 Tag：将从最新帖子开始按匹配数量处理，保存时使用未分类或频道名规则。"
-        ), 1)
+        )
+        notice_row.addWidget(self._tag_empty_notice_label, 1)
         form.addWidget(self._tag_empty_notice, 9, 0, 1, 2)
         self.tag_edit.textChanged.connect(self._update_tag_empty_notice)
         self._apply_notice_styles()
@@ -363,7 +367,9 @@ class TaskPage(ScrollPage):
             ("跳过重复文件", "开启"),
             ("包含回复中的图片", "关闭"),
             ("完成后打开目录", "关闭"),
+            ("空 Tag 处理", "未分类"),
             ("并发下载数", "6"),
+            ("单文件分片数", "1"),
             ("文件下载间隔", "0.5 秒"),
             ("文件名长度限制", "100"),
         ]
@@ -419,6 +425,15 @@ class TaskPage(ScrollPage):
         self.end_date_edit.setEnabled(enabled)
 
     def _update_tag_empty_notice(self):
+        if hasattr(self, "_tag_empty_notice_label"):
+            messages = {
+                "skip": "未填写 Tag：当前默认会跳过空 Tag 任务，请填写 Tag 或在设置中更改处理方式。",
+                "channel": "未填写 Tag：将扫描最新帖子，并使用频道名作为保存分类。",
+                "uncategorized": "未填写 Tag：将扫描最新帖子，并保存到未分类目录。",
+            }
+            self._tag_empty_notice_label.setText(
+                messages.get(self._default_empty_tag_action, messages["uncategorized"])
+            )
         self._tag_empty_notice.setVisible(not self.tag_edit.text().strip())
 
     def eventFilter(self, watched, event):
@@ -577,11 +592,11 @@ class TaskPage(ScrollPage):
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
         self.only_images_cb.setChecked(True)
-        self.skip_dup_cb.setChecked(True)
+        self.skip_dup_cb.setChecked(self._default_skip_duplicates)
         self.include_replies_cb.setChecked(True)
         self.extract_btn_cb.setChecked(True)
         self.btn_keyword_edit.setText("原图")
-        self.open_after_cb.setChecked(False)
+        self.open_after_cb.setChecked(self._default_open_after)
         self.save_ext_info_cb.setChecked(self._default_save_extended_info)
         self._adv_json_str = _default_advanced_json()
         self._adv_json_badge.setText(
@@ -640,13 +655,19 @@ class TaskPage(ScrollPage):
         save_mode_label: str,
         save_mode_key: str = "",
         save_extended_info: bool = False,
+        open_after_download: bool = False,
+        skip_duplicates: bool = True,
     ):
         self._default_save_root = save_root
         self._default_mode_label = save_mode_label
         self._default_mode_key = save_mode_key
         self._default_save_extended_info = save_extended_info
+        self._default_open_after = open_after_download
+        self._default_skip_duplicates = skip_duplicates
         self.path_edit.setText(save_root)
         self.save_ext_info_cb.setChecked(save_extended_info)
+        self.open_after_cb.setChecked(open_after_download)
+        self.skip_dup_cb.setChecked(skip_duplicates)
         if "保存位置" in self._summary_labels:
             self._summary_labels["保存位置"].setText(save_root)
         if "保存模式" in self._summary_labels:
@@ -753,9 +774,12 @@ class TaskPage(ScrollPage):
         duplicate_mode: str,
         open_after_download: bool,
         concurrency: int,
+        chunk_concurrency: int,
         file_download_interval: float,
         filename_limit: int,
+        empty_tag_action: str = "uncategorized",
     ):
+        self._default_empty_tag_action = empty_tag_action
         if "文件命名" in self._summary_labels:
             self._summary_labels["文件命名"].setText(
                 "优先保留原名" if preserve_original_name else filename_template
@@ -769,14 +793,26 @@ class TaskPage(ScrollPage):
             self._summary_labels["完成后打开目录"].setText(
                 "开启" if open_after_download else "关闭"
             )
+        if "空 Tag 处理" in self._summary_labels:
+            empty_tag_labels = {
+                "uncategorized": "未分类",
+                "skip": "跳过",
+                "channel": "频道名",
+            }
+            self._summary_labels["空 Tag 处理"].setText(
+                empty_tag_labels.get(empty_tag_action, empty_tag_action)
+            )
         if "并发下载数" in self._summary_labels:
             self._summary_labels["并发下载数"].setText(str(concurrency))
+        if "单文件分片数" in self._summary_labels:
+            self._summary_labels["单文件分片数"].setText(str(chunk_concurrency))
         if "文件下载间隔" in self._summary_labels:
             self._summary_labels["文件下载间隔"].setText(
                 f"{file_download_interval:g} 秒"
             )
         if "文件名长度限制" in self._summary_labels:
             self._summary_labels["文件名长度限制"].setText(str(filename_limit))
+        self._update_tag_empty_notice()
 
     def add_mode_item(self, text: str, key: str):
         self.mode_combo.addItem(text, userData=key)

@@ -321,6 +321,11 @@ class YandePage(ScrollPage):
     def _clear_preview_cache(self):
         self._current_rows = []
         if hasattr(self, "status_label") and not self._busy:
+            if hasattr(self, "table"):
+                self.table.setRowCount(0)
+            if hasattr(self, "progress_bar"):
+                self.progress_bar.setRange(0, 1)
+                self.progress_bar.setValue(0)
             self.status_label.setText("搜索条件已变化，请重新预览，或直接按当前条件下载。")
 
     def _choose_save_root(self):
@@ -373,8 +378,12 @@ class YandePage(ScrollPage):
             "rows": list(self._current_rows),
         }
         if self.date_filter_cb.isChecked():
-            params["date_from"] = self.start_date_edit.date().toString("yyyy-MM-dd")
-            params["date_to"] = self.end_date_edit.date().toString("yyyy-MM-dd")
+            start = self.start_date_edit.date()
+            end = self.end_date_edit.date()
+            if start > end:
+                start, end = end, start
+            params["date_from"] = start.toString("yyyy-MM-dd")
+            params["date_to"] = end.toString("yyyy-MM-dd")
         return params
 
     def set_busy(self, busy: bool):

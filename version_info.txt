@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 3, 1, 0),
-    prodvers=(2, 3, 1, 0),
+    filevers=(2, 4, 3, 0),
+    prodvers=(2, 4, 3, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'TG Pic Collector'),
           StringStruct('FileDescription', 'Telegram 评论区图片下载器'),
-          StringStruct('FileVersion', '2.3.1'),
+          StringStruct('FileVersion', '2.4.3'),
           StringStruct('InternalName', 'TG Pic Collector'),
           StringStruct('OriginalFilename', 'TG Pic Collector.exe'),
           StringStruct('ProductName', 'TG Pic Collector'),
-          StringStruct('ProductVersion', '2.3.1')
+          StringStruct('ProductVersion', '2.4.3')
         ]
       )
     ]),

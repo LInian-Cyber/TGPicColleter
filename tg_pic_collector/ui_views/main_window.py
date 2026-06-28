@@ -76,6 +76,7 @@ class MainWindow(FluentWindow):
     open_log_folder_requested = Signal()
     history_clear_requested = Signal()
     history_delete_requested = Signal(int)
+    history_open_folder_requested = Signal(str)
     trend_period_changed = Signal(str)
     # 窗口关闭
     window_closing = Signal()
@@ -196,6 +197,9 @@ class MainWindow(FluentWindow):
         # 历史页
         self.history_page.clear_requested.connect(self.history_clear_requested.emit)
         self.history_page.delete_history_requested.connect(self.history_delete_requested.emit)
+        self.history_page.open_history_folder_requested.connect(
+            self.history_open_folder_requested.emit
+        )
         self.history_page.open_folder_requested.connect(self.open_folder_requested.emit)
         self.history_page.pause_task_requested.connect(self.task_pause_requested.emit)
         self.history_page.delete_task_requested.connect(self.task_delete_requested.emit)
@@ -274,12 +278,16 @@ class MainWindow(FluentWindow):
         save_mode_label: str,
         save_mode_key: str = "",
         save_extended_info: bool = False,
+        open_after_download: bool = False,
+        skip_duplicates: bool = True,
     ):
         self.task_page.set_defaults(
             save_root,
             save_mode_label,
             save_mode_key,
             save_extended_info,
+            open_after_download,
+            skip_duplicates,
         )
 
     def set_task_rule_summary(
@@ -289,8 +297,10 @@ class MainWindow(FluentWindow):
         duplicate_mode: str,
         open_after_download: bool,
         concurrency: int,
+        chunk_concurrency: int,
         file_download_interval: float,
         filename_limit: int,
+        empty_tag_action: str = "uncategorized",
     ):
         self.task_page.set_rule_summary(
             filename_template,
@@ -298,8 +308,10 @@ class MainWindow(FluentWindow):
             duplicate_mode,
             open_after_download,
             concurrency,
+            chunk_concurrency,
             file_download_interval,
             filename_limit,
+            empty_tag_action,
         )
 
     def set_task_busy(self, busy: bool):

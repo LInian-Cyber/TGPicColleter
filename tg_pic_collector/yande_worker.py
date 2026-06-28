@@ -23,6 +23,14 @@ YANDE_HOST = "https://yande.re"
 USER_AGENT = "TG-Pic-Collector/1.0"
 MIN_SEGMENT_SIZE = 512 * 1024
 DEFAULT_DOWNLOAD_TIMEOUT = 25
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 def _safe_filename(name: str, fallback: str, limit: int = 180) -> str:
@@ -31,6 +39,8 @@ def _safe_filename(name: str, fallback: str, limit: int = 180) -> str:
     path = Path(raw or fallback)
     suffix = path.suffix[:12] or ".jpg"
     stem = (path.stem or fallback)[: max(24, limit - len(suffix))].strip(" .")
+    if stem.upper() in WINDOWS_RESERVED_NAMES:
+        stem = f"_{stem}"
     return f"{stem or fallback}{suffix}"
 
 
@@ -51,7 +61,11 @@ def _tag_folder_name(tags: str) -> str:
 
 
 def _post_id_from_text(text: str) -> int:
-    match = re.search(r"(?:post/show/|/post\?tags=id%3A|id:)(\d+)", text or "")
+    match = re.search(
+        r"(?:post/show/|/post\?tags=id(?:%3A|:)|\bid:)(\d+)",
+        text or "",
+        flags=re.IGNORECASE,
+    )
     if match:
         return int(match.group(1))
     stripped = str(text or "").strip()

@@ -58,6 +58,7 @@ class _TaskDetailTip(QFrame):
 class HistoryPage(ScrollPage):
     clear_requested = Signal()
     open_folder_requested = Signal()
+    open_history_folder_requested = Signal(str)
     pause_task_requested = Signal(int)
     delete_task_requested = Signal(int)
     delete_history_requested = Signal(int)
@@ -169,7 +170,7 @@ class HistoryPage(ScrollPage):
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self._table.setColumnWidth(6, 58)
+        self._table.setColumnWidth(6, 96)
         self._table.setShowGrid(False)
         self._table.setAlternatingRowColors(False)
         self._table.setMinimumHeight(420)
@@ -380,6 +381,16 @@ class HistoryPage(ScrollPage):
                     }.get(v, C_MUTED)
                     item.setForeground(QColor(color))
                 self._table.setItem(r, c, item)
+            open_btn = ToolButton(FIF.FOLDER)
+            open_btn.setFixedSize(28, 28)
+            open_btn.setToolTip("打开这条记录的保存目录")
+            if rec.save_root:
+                open_btn.clicked.connect(
+                    lambda checked=False, path=rec.save_root: self.open_history_folder_requested.emit(path)
+                )
+            else:
+                open_btn.setEnabled(False)
+                open_btn.setToolTip("这条历史记录没有保存目录")
             delete_btn = ToolButton(FIF.DELETE)
             delete_btn.setFixedSize(28, 28)
             delete_btn.setToolTip("删除这条历史记录")
@@ -390,6 +401,7 @@ class HistoryPage(ScrollPage):
             ops_layout = QHBoxLayout(ops_widget)
             ops_layout.setContentsMargins(4, 4, 4, 4)
             ops_layout.addStretch()
+            ops_layout.addWidget(open_btn)
             ops_layout.addWidget(delete_btn)
             ops_layout.addStretch()
             self._table.setCellWidget(r, 6, ops_widget)

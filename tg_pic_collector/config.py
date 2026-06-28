@@ -10,6 +10,32 @@ from pathlib import Path
 from PySide6.QtCore import QStandardPaths
 
 
+DEFAULT_SAVE_ROOT = str(Path.home() / "Pictures" / "TG Pic Collector")
+DEFAULT_MAX_POSTS = 100
+DEFAULT_PREVIEW_MAX_RESULTS = 50
+DEFAULT_CONCURRENCY = 6
+DEFAULT_CHUNK_CONCURRENCY = 1
+DEFAULT_FILE_DOWNLOAD_INTERVAL = 0.5
+DEFAULT_FILENAME_LIMIT = 100
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def _safe_fs_name(value: str, fallback: str = "default") -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value or "").strip(" .")
+    if not name:
+        name = fallback
+    if name.upper() in WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
+
+
 @dataclass
 class AppConfig:
     api_id: str = ""
@@ -17,10 +43,10 @@ class AppConfig:
     phone: str = ""
     channel: str = ""
     tag: str = ""
-    save_root: str = str(Path.home() / "Pictures" / "TG Pic Collector")
+    save_root: str = DEFAULT_SAVE_ROOT
     save_mode: str = "channel_tag"
-    max_posts: int = 100
-    preview_max_results: int = 50
+    max_posts: int = DEFAULT_MAX_POSTS
+    preview_max_results: int = DEFAULT_PREVIEW_MAX_RESULTS
     session_name: str = "default"
     session_dir: str = ""
     skip_duplicates: bool = True
@@ -31,9 +57,10 @@ class AppConfig:
     theme_mode: str = "auto"
     lang: str = "zh_CN"
     history: list[dict] | None = None
-    concurrency: int = 6
-    file_download_interval: float = 0.5
-    filename_limit: int = 100
+    concurrency: int = DEFAULT_CONCURRENCY
+    chunk_concurrency: int = DEFAULT_CHUNK_CONCURRENCY
+    file_download_interval: float = DEFAULT_FILE_DOWNLOAD_INTERVAL
+    filename_limit: int = DEFAULT_FILENAME_LIMIT
     empty_tag_action: str = "uncategorized"
     restore_on_launch: bool = True
     use_last_mode: bool = True
@@ -62,9 +89,9 @@ class AppConfig:
 
     @property
     def session_path(self) -> Path:
-        safe_session = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", self.session_name).strip(" .")
+        safe_session = _safe_fs_name(self.session_name, "default")
         root = Path(self.session_dir).expanduser() if self.session_dir else self.config_dir / "sessions"
-        return root / (safe_session or "default")
+        return root / safe_session
 
     @staticmethod
     def account_key(session_name: str, session_dir: str = "") -> str:
@@ -79,10 +106,13 @@ class AppConfig:
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         payload = asdict(self)
-        (self.config_dir / "config.json").write_text(
+        config_path = self.config_dir / "config.json"
+        tmp_path = config_path.with_name(f"{config_path.name}.tmp")
+        tmp_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        tmp_path.replace(config_path)
 
     def add_history(self, record: dict) -> None:
         history = list(self.history or [])
@@ -130,7 +160,7 @@ class AppConfig:
                         item["avatar_updated_at"] = datetime.now().isoformat(timespec="seconds")
                 # 最近搜索过的频道放到最前面，方便下次直接选。
                 history.insert(0, history.pop(index))
-                self.channel_history = history
+                self.channel_history = history[:20]
                 self.save()
                 return
         
@@ -168,7 +198,7 @@ class AppConfig:
         avatar_dir.mkdir(parents=True, exist_ok=True)
 
         # 使用频道ID作为文件名（安全化）
-        safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f@-]', "_", channel_id).strip(" .")
+        safe_id = _safe_fs_name(re.sub(r"[@-]", "_", channel_id), "channel")
         avatar_path = avatar_dir / f"{safe_id}.jpg"
 
         try:

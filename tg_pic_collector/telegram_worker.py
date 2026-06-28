@@ -25,6 +25,17 @@ from .models import (
 )
 from .network import proxy_label, telethon_proxy
 
+
+PreviewCacheKey = tuple[str, str, str, str]
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
 try:
     from .crypto import decrypt_session, encrypt_session
 except ImportError:
@@ -45,7 +56,12 @@ except ImportError:
 
 def safe_name(value: str, fallback: str = "untitled", max_length: int = 90) -> str:
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
-    return value[:max_length] or fallback
+    value = value[:max_length].rstrip(" .")
+    if not value:
+        return fallback
+    if value.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        value = f"_{value}"
+    return value[:max_length].rstrip(" .") or fallback
 
 
 def is_webpage_preview(message: Any) -> bool:
@@ -174,12 +190,13 @@ class TelegramWorker(QThread):
         self._phone = credentials.phone
         self._client: TelegramClient | None = None
         # 搜索预览缓存：UI 摘要之外还保留帖子和媒体消息，下载时无需再次扫描。
-        self._preview_cache: dict[tuple[str, str], list[dict]] = {}
+        self._preview_cache: dict[PreviewCacheKey, list[dict]] = {}
         # 仅完整扫描过对应数量的预览缓存，才允许正式下载复用。
-        self._preview_cache_limits: dict[tuple[str, str], int] = {}
-        self._preview_cache_totals: dict[tuple[str, str], int] = {}
-        self._preview_cache_requests: dict[tuple[str, str], tuple[Any, ...]] = {}
+        self._preview_cache_limits: dict[PreviewCacheKey, int] = {}
+        self._preview_cache_totals: dict[PreviewCacheKey, int] = {}
+        self._preview_cache_requests: dict[PreviewCacheKey, tuple[Any, ...]] = {}
         self._downloaded_media_keys: set[str] = set()
+        self._downloaded_media_paths: dict[str, str] = {}
         self._downloaded_media_index_path: Path | None = None
         self._thumbnail_cache: dict[str, tuple[float, bytes]] = {}
         self._thumbnail_cache_ttl = 24 * 60 * 60
@@ -606,6 +623,13 @@ class TelegramWorker(QThread):
     async def _scan(self, client: TelegramClient, request: ScanRequest) -> None:
         self.scan_started.emit()
         self.pause_event.set()  # 开始新任务时确保非暂停状态
+        if not request.tag.strip() and request.empty_tag_action == "skip":
+            self.logger.info("Tag 为空且设置为跳过，任务未扫描")
+            self.status_changed.emit("Tag 为空且设置为跳过，未扫描帖子")
+            self.scan_plan_ready.emit(0, 0)
+            self.scan_discovery_finished.emit(0, 0)
+            self.scan_finished.emit(0, 0, 0)
+            return
 
         async def wait_if_paused() -> bool:
             """如果处于暂停状态就挂起，直到继续或取消。返回 True 表示应该 continue/break。"""
@@ -634,6 +658,7 @@ class TelegramWorker(QThread):
         post_pending: dict[int, int] = {}
         post_discovery_done: set[int] = set()
         post_status_emitted: set[int] = set()
+        pending_media_targets: dict[str, Path] = {}
         self._load_media_index(request.save_root)
 
         def emit_metrics(force: bool = False) -> None:
@@ -754,8 +779,7 @@ class TelegramWorker(QThread):
                         chunk_concurrency=request.chunk_concurrency,
                     )
                     if success and media_key:
-                        self._downloaded_media_keys.add(media_key)
-                        self._save_media_index()
+                        self._remember_media_download(media_key, target)
                     if success:
                         write_extended_info(
                             post_id,
@@ -771,6 +795,8 @@ class TelegramWorker(QThread):
                     self.logger.error(f"下载失败 - 帖子 #{post_id}: {target} ({exc})")
                     record_file(post_id, target, False, f"下载失败: {exc}")
                 finally:
+                    if media_key and pending_media_targets.get(media_key) == target:
+                        pending_media_targets.pop(media_key, None)
                     post_pending[post_id] = max(0, post_pending.get(post_id, 1) - 1)
                     download_queue.task_done()
                     emit_finished_post(post_id)
@@ -782,19 +808,24 @@ class TelegramWorker(QThread):
             metadata_context: dict[str, Any] | None = None,
         ) -> None:
             media_key = self._media_key(message)
-            if request.skip_duplicates and media_key and media_key in self._downloaded_media_keys:
-                if target.exists():
-                    record_file(post_id, target, False, "媒体已下载过")
+            if request.skip_duplicates and media_key:
+                indexed_target = self._indexed_media_path(media_key, target)
+                if indexed_target:
+                    record_file(post_id, indexed_target, False, "媒体已下载过")
                     return
-                self._downloaded_media_keys.discard(media_key)
-                self.logger.info(
-                    f"媒体索引命中但目标文件已不存在，重新下载 - 帖子 #{post_id}: {target}"
-                )
+                pending_target = pending_media_targets.get(media_key)
+                if pending_target:
+                    record_file(post_id, pending_target, False, "媒体已在本次任务入队")
+                    return
             post_pending[post_id] = post_pending.get(post_id, 0) + 1
             try:
                 await download_queue.put((post_id, message, target, media_key, metadata_context or {}))
+                if request.skip_duplicates and media_key:
+                    pending_media_targets[media_key] = target
                 emit_metrics()
             except BaseException:
+                if media_key and pending_media_targets.get(media_key) == target:
+                    pending_media_targets.pop(media_key, None)
                 post_pending[post_id] = max(0, post_pending.get(post_id, 1) - 1)
                 raise
 
@@ -850,7 +881,7 @@ class TelegramWorker(QThread):
             if request_tag and request_tag not in source_tags:
                 source_tags.append(request_tag)
             match = re.search(
-                r"(?:https?://)?t\.me/(?:c/)?([^/\s?#]+)/(\d+)",
+                r"(?:https?://)?(?:t|telegram)\.me/(?:c/)?([^/\s?#]+)/(\d+)",
                 url,
                 re.IGNORECASE,
             )
@@ -1638,13 +1669,23 @@ class TelegramWorker(QThread):
             return False
 
         async def download() -> bool:
+            target.parent.mkdir(parents=True, exist_ok=True)
             if chunk_concurrency <= 1:
                 result = await client.download_media(message, file=str(target))
                 return bool(result)
 
             media = getattr(message, "media", None)
-            document = getattr(media, "document", None) or getattr(media, "photo", None)
-            file_size: int = getattr(document, "size", 0) if document else 0
+            document = (
+                message_document(message)
+                or getattr(media, "photo", None)
+                or getattr(message, "photo", None)
+            )
+            file_info = getattr(message, "file", None)
+            file_size = int(
+                getattr(document, "size", 0)
+                or getattr(file_info, "size", 0)
+                or 0
+            )
 
             MIN_CHUNK_SIZE = 512 * 1024  # 512 KB，低于这个没必要分片
             if file_size < MIN_CHUNK_SIZE * chunk_concurrency:
@@ -1655,33 +1696,81 @@ class TelegramWorker(QThread):
             ALIGN = 4096
             chunk_size = ((chunk_size + ALIGN - 1) // ALIGN) * ALIGN
 
-            ranges: list[tuple[int, int]] = []
+            ranges: list[tuple[int, int, Path]] = []
             offset = 0
+            index = 0
             while offset < file_size:
                 end = min(offset + chunk_size, file_size)
-                ranges.append((offset, end - offset))
+                ranges.append(
+                    (
+                        offset,
+                        end - offset,
+                        target.with_name(f"{target.name}.part.{index}"),
+                    )
+                )
                 offset = end
+                index += 1
 
-            async def fetch_chunk(off: int, lim: int) -> bytes:
-                buf = bytearray()
-                async for block in client.iter_download(message, offset=off, limit=lim):
-                    buf.extend(block)
-                return bytes(buf)
+            request_size = MIN_CHUNK_SIZE
 
-            chunks: list[bytes | BaseException] = await asyncio.gather(
-                *(fetch_chunk(off, lim) for off, lim in ranges),
-                return_exceptions=True,
-            )
+            async def fetch_chunk(off: int, length: int, part_path: Path) -> Path:
+                written = 0
+                limit = (length + request_size - 1) // request_size
+                part_path.unlink(missing_ok=True)
+                with part_path.open("wb") as fh:
+                    async for block in client.iter_download(
+                        message,
+                        offset=off,
+                        limit=limit,
+                        chunk_size=request_size,
+                        request_size=request_size,
+                        file_size=file_size,
+                    ):
+                        if written >= length:
+                            break
+                        remaining = length - written
+                        data = bytes(block)[:remaining]
+                        fh.write(data)
+                        written += len(data)
+                if written != length:
+                    raise OSError(
+                        f"incomplete chunk at offset {off}: {written} != {length}"
+                    )
+                return part_path
 
-            if any(isinstance(c, BaseException) for c in chunks):
+            tmp_path = target.with_suffix(target.suffix + ".part")
+            try:
+                parts: list[Path | BaseException] = await asyncio.gather(
+                    *(fetch_chunk(off, lim, part) for off, lim, part in ranges),
+                    return_exceptions=True,
+                )
+
+                if any(isinstance(part, BaseException) for part in parts):
+                    raise OSError("chunked download failed")
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path.unlink(missing_ok=True)
+                with tmp_path.open("wb") as out:
+                    for _, _, part_path in ranges:
+                        with part_path.open("rb") as part_file:
+                            while True:
+                                data = part_file.read(1024 * 512)
+                                if not data:
+                                    break
+                                out.write(data)
+                if tmp_path.stat().st_size != file_size:
+                    raise OSError(
+                        f"merged file size mismatch: {tmp_path.stat().st_size} != {file_size}"
+                    )
+                tmp_path.replace(target)
+                return target.exists() and target.stat().st_size > 0
+            except OSError:
+                tmp_path.unlink(missing_ok=True)
                 result = await client.download_media(message, file=str(target))
                 return bool(result)
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("wb") as fh:
-                for chunk in chunks:
-                    fh.write(chunk)  # type: ignore[arg-type]
-            return target.exists() and target.stat().st_size > 0
+            finally:
+                for _, _, part_path in ranges:
+                    part_path.unlink(missing_ok=True)
 
         async with semaphore:
             success = await download()
@@ -1694,33 +1783,88 @@ class TelegramWorker(QThread):
         """Load per-save-root media ids used for duplicate detection."""
         self._downloaded_media_index_path = save_root / ".tg_pic_collector_media.json"
         self._downloaded_media_keys = set()
+        self._downloaded_media_paths = {}
         try:
             if self._downloaded_media_index_path.exists():
                 payload = json.loads(self._downloaded_media_index_path.read_text(encoding="utf-8"))
                 self._downloaded_media_keys = {
                     str(item) for item in payload.get("media_keys", []) if item
                 }
+                media_paths = payload.get("media_paths", {})
+                if isinstance(media_paths, dict):
+                    self._downloaded_media_paths = {
+                        str(key): str(value)
+                        for key, value in media_paths.items()
+                        if key and value
+                    }
+                    self._downloaded_media_keys.update(self._downloaded_media_paths)
         except (OSError, ValueError, TypeError):
             self._downloaded_media_keys = set()
+            self._downloaded_media_paths = {}
 
     def _save_media_index(self) -> None:
         if not self._downloaded_media_index_path:
             return
         try:
             self._downloaded_media_index_path.parent.mkdir(parents=True, exist_ok=True)
-            self._downloaded_media_index_path.write_text(
-                json.dumps(
-                    {
-                        "updated_at": datetime.now().isoformat(timespec="seconds"),
-                        "media_keys": sorted(self._downloaded_media_keys),
+            payload = json.dumps(
+                {
+                    "version": 2,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "media_keys": sorted(self._downloaded_media_keys),
+                    "media_paths": {
+                        key: self._downloaded_media_paths[key]
+                        for key in sorted(self._downloaded_media_paths)
                     },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            tmp_path = self._downloaded_media_index_path.with_name(
+                f"{self._downloaded_media_index_path.name}.tmp"
+            )
+            tmp_path.write_text(
+                payload,
                 encoding="utf-8",
             )
+            tmp_path.replace(self._downloaded_media_index_path)
         except OSError:
             pass
+
+    def _indexed_media_path(self, media_key: str, fallback_target: Path | None = None) -> Path | None:
+        if not media_key:
+            return None
+        root = self._downloaded_media_index_path.parent if self._downloaded_media_index_path else None
+        raw_path = self._downloaded_media_paths.get(media_key, "")
+        if raw_path and root:
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if candidate.exists():
+                return candidate
+            self._downloaded_media_paths.pop(media_key, None)
+            self._downloaded_media_keys.discard(media_key)
+            self._save_media_index()
+        if fallback_target and media_key in self._downloaded_media_keys:
+            if fallback_target.exists():
+                return fallback_target
+            self._downloaded_media_keys.discard(media_key)
+            self._save_media_index()
+        return None
+
+    def _remember_media_download(self, media_key: str, target: Path) -> None:
+        if not media_key or not target.exists():
+            return
+        self._downloaded_media_keys.add(media_key)
+        root = self._downloaded_media_index_path.parent if self._downloaded_media_index_path else None
+        stored_path = str(target)
+        if root:
+            try:
+                stored_path = str(target.resolve().relative_to(root.resolve()))
+            except (OSError, ValueError):
+                stored_path = str(target.resolve())
+        self._downloaded_media_paths[media_key] = stored_path
+        self._save_media_index()
 
     @staticmethod
     def _media_key(message: Any) -> str:
@@ -1863,6 +2007,35 @@ class TelegramWorker(QThread):
         }
 
     @staticmethod
+    def _is_telegram_post_url(url: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:https?://)?(?:t|telegram)\.me/(?:c/)?[^/\s?#]+/\d+",
+                str(url or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _find_button_url(message: Any, keyword: str) -> tuple[str, str] | None:
+        keyword_folded = keyword.strip().casefold()
+        if not keyword_folded:
+            return None
+        for row in getattr(message, "buttons", None) or []:
+            buttons = row if isinstance(row, (list, tuple)) else [row]
+            for button in buttons:
+                text = str(getattr(button, "text", "") or "").strip()
+                url = str(getattr(button, "url", "") or "").strip()
+                if url and keyword_folded in text.casefold():
+                    return text, url
+        return None
+
+    @staticmethod
+    def _write_link_shortcut(target: Path, url: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"[InternetShortcut]\nURL={url}\n", encoding="utf-8")
+
+    @staticmethod
     def _telegram_post_links(message: Any) -> list[str]:
         raw_text = str(getattr(message, "message", "") or "")
         links: list[str] = []
@@ -1875,11 +2048,11 @@ class TelegramWorker(QThread):
             url = str(getattr(entity, "url", "") or "").strip()
             if not url and type(entity).__name__ == "MessageEntityUrl":
                 url = text
-            if re.search(r"(?:https?://)?t\.me/(?:c/)?[^/\s?#]+/\d+", url):
+            if TelegramWorker._is_telegram_post_url(url):
                 links.append(url)
         links.extend(
             re.findall(
-                r"(?:https?://)?t\.me/(?:c/)?[^/\s?#)]+/\d+",
+                r"(?:https?://)?(?:t|telegram)\.me/(?:c/)?[^/\s?#)]+/\d+",
                 raw_text,
                 flags=re.IGNORECASE,
             )
@@ -1892,10 +2065,14 @@ class TelegramWorker(QThread):
 
     @staticmethod
     def _find_original_link(message: Any, keyword: str) -> tuple[str, str] | None:
-        """Find a matching Telegram post URL in the post body's rich-text links."""
+        """Find a matching Telegram post URL in buttons or message text."""
         keyword_folded = keyword.strip().casefold()
         if not keyword_folded:
             return None
+
+        button_link = TelegramWorker._find_button_url(message, keyword)
+        if button_link and TelegramWorker._is_telegram_post_url(button_link[1]):
+            return button_link
 
         raw_text = str(getattr(message, "message", "") or "")
         candidates: list[tuple[str, str]] = []
@@ -1908,7 +2085,7 @@ class TelegramWorker(QThread):
             url = str(getattr(entity, "url", "") or "").strip()
             if not url and type(entity).__name__ == "MessageEntityUrl":
                 url = text
-            if re.search(r"(?:https?://)?t\.me/(?:c/)?[^/\s?#]+/\d+", url):
+            if TelegramWorker._is_telegram_post_url(url):
                 if keyword_folded in text.casefold():
                     return text, url
                 candidates.append((text, url))
@@ -1917,12 +2094,12 @@ class TelegramWorker(QThread):
         for text, url in re.findall(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", raw_text):
             if (
                 keyword_folded in text.casefold()
-                and re.search(r"(?:https?://)?t\.me/(?:c/)?[^/\s?#]+/\d+", url)
+                and TelegramWorker._is_telegram_post_url(url)
             ):
                 return text.strip(), url.strip()
 
         for url in re.findall(
-            r"(?:https?://)?t\.me/(?:c/)?[^/\s?#)]+/\d+",
+            r"(?:https?://)?(?:t|telegram)\.me/(?:c/)?[^/\s?#)]+/\d+",
             raw_text,
             flags=re.IGNORECASE,
         ):

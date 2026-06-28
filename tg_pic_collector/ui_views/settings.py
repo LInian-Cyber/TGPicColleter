@@ -3,6 +3,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from ..config import (
+    DEFAULT_CHUNK_CONCURRENCY,
+    DEFAULT_CONCURRENCY,
+    DEFAULT_FILE_DOWNLOAD_INTERVAL,
+    DEFAULT_FILENAME_LIMIT,
+    DEFAULT_MAX_POSTS,
+    DEFAULT_PREVIEW_MAX_RESULTS,
+    DEFAULT_SAVE_ROOT,
+)
 from ..network import proxy_label, yande_proxy_warning
 from .common import *
 from .common import _UI_DIR, _asset, _divider, _img_label, _muted, _set_margins
@@ -143,7 +152,7 @@ class SettingsPage(ScrollPage):
         dl.body.addWidget(StrongBodyLabel("每次最多匹配帖子数量"))
         self.max_posts = SpinBox()
         self.max_posts.setRange(1, 5000)
-        self.max_posts.setValue(200)
+        self.max_posts.setValue(DEFAULT_MAX_POSTS)
         self.max_posts.setMinimumSize(180, 36)
         dl.body.addWidget(self.max_posts)
         dl.body.addWidget(_muted(
@@ -153,7 +162,7 @@ class SettingsPage(ScrollPage):
         dl.body.addWidget(StrongBodyLabel("搜索预览最多展示帖子数"))
         self.preview_max_results = SpinBox()
         self.preview_max_results.setRange(10, 500)
-        self.preview_max_results.setValue(50)
+        self.preview_max_results.setValue(DEFAULT_PREVIEW_MAX_RESULTS)
         self.preview_max_results.setMinimumSize(180, 36)
         dl.body.addWidget(self.preview_max_results)
         dl.body.addWidget(_muted(
@@ -235,15 +244,22 @@ class SettingsPage(ScrollPage):
         card.body.addWidget(StrongBodyLabel("并发下载数"))
         self.concurrency_spin = SpinBox()
         self.concurrency_spin.setRange(1, 20)
-        self.concurrency_spin.setValue(6)
+        self.concurrency_spin.setValue(DEFAULT_CONCURRENCY)
         self.concurrency_spin.setMinimumSize(140, 36)
         card.body.addWidget(self.concurrency_spin)
+        card.body.addWidget(StrongBodyLabel("Telegram 单文件分片数"))
+        self.chunk_concurrency_spin = SpinBox()
+        self.chunk_concurrency_spin.setRange(1, 8)
+        self.chunk_concurrency_spin.setValue(DEFAULT_CHUNK_CONCURRENCY)
+        self.chunk_concurrency_spin.setMinimumSize(140, 36)
+        self.chunk_concurrency_spin.setToolTip("大文件可尝试 2-4；不稳定或限流时保持 1。")
+        card.body.addWidget(self.chunk_concurrency_spin)
         card.body.addWidget(StrongBodyLabel("单个文件下载后等待（秒）"))
         self.interval_spin = DoubleSpinBox()
         self.interval_spin.setRange(0, 10)
         self.interval_spin.setSingleStep(0.1)
         self.interval_spin.setDecimals(1)
-        self.interval_spin.setValue(0.5)
+        self.interval_spin.setValue(DEFAULT_FILE_DOWNLOAD_INTERVAL)
         self.interval_spin.setMinimumSize(140, 36)
         card.body.addWidget(self.interval_spin)
         card.body.addWidget(_muted(
@@ -252,7 +268,7 @@ class SettingsPage(ScrollPage):
         card.body.addWidget(StrongBodyLabel("文件名长度限制"))
         self.fn_len_spin = SpinBox()
         self.fn_len_spin.setRange(20, 255)
-        self.fn_len_spin.setValue(100)
+        self.fn_len_spin.setValue(DEFAULT_FILENAME_LIMIT)
         self.fn_len_spin.setMinimumSize(140, 36)
         card.body.addWidget(self.fn_len_spin)
         layout.addWidget(card)
@@ -591,7 +607,7 @@ class SettingsPage(ScrollPage):
         return w
 
     def _update_save_mode_preview(self):
-        root_text = self.path_edit.text().strip() or str(Path.home() / "Pictures" / "TG Pic Collector")
+        root_text = self.path_edit.text().strip() or DEFAULT_SAVE_ROOT
         mode = self.mode_combo.currentData() or "channel_tag"
         root = Path(root_text)
         examples = {
@@ -650,14 +666,15 @@ class SettingsPage(ScrollPage):
             self._filename_preview_lbl.setText("预览：格式错误，请检查模板变量")
 
     def _restore_defaults(self):
-        self.path_edit.setText("")
-        self.max_posts.setValue(200)
-        self.preview_max_results.setValue(50)
+        self.path_edit.setText(DEFAULT_SAVE_ROOT)
+        self.max_posts.setValue(DEFAULT_MAX_POSTS)
+        self.preview_max_results.setValue(DEFAULT_PREVIEW_MAX_RESULTS)
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData("channel_tag")))
         self.preserve_original_sw.setChecked(True)
-        self.concurrency_spin.setValue(6)
-        self.interval_spin.setValue(0.5)
-        self.fn_len_spin.setValue(100)
+        self.concurrency_spin.setValue(DEFAULT_CONCURRENCY)
+        self.chunk_concurrency_spin.setValue(DEFAULT_CHUNK_CONCURRENCY)
+        self.interval_spin.setValue(DEFAULT_FILE_DOWNLOAD_INTERVAL)
+        self.fn_len_spin.setValue(DEFAULT_FILENAME_LIMIT)
         self.tag_empty_combo.setCurrentIndex(
             max(0, self.tag_empty_combo.findData("uncategorized"))
         )
@@ -680,6 +697,7 @@ class SettingsPage(ScrollPage):
             "max_posts": self.max_posts.value(),
             "preview_max_results": self.preview_max_results.value(),
             "concurrency": self.concurrency_spin.value(),
+            "chunk_concurrency": self.chunk_concurrency_spin.value(),
             "file_download_interval": float(self.interval_spin.value()),
             "filename_limit": self.fn_len_spin.value(),
             "empty_tag_action": self.tag_empty_combo.currentData() or "uncategorized",
@@ -740,6 +758,8 @@ class SettingsPage(ScrollPage):
             self.preview_max_results.setValue(int(d["preview_max_results"]))
         if "concurrency" in d:
             self.concurrency_spin.setValue(int(d["concurrency"]))
+        if "chunk_concurrency" in d:
+            self.chunk_concurrency_spin.setValue(int(d["chunk_concurrency"]))
         if "file_download_interval" in d:
             self.interval_spin.setValue(float(d["file_download_interval"]))
         if "filename_limit" in d:

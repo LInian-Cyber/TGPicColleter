@@ -83,6 +83,8 @@ class AppController(QObject):
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode if self.config.use_last_mode else "default",
             self.config.save_extended_info,
+            self.config.open_after_download,
+            self.config.duplicate_mode == "skip",
         )
 
         # 加载频道历史
@@ -109,8 +111,10 @@ class AppController(QObject):
             self.config.duplicate_mode,
             self.config.open_after_download,
             self.config.concurrency,
+            self.config.chunk_concurrency,
             self.config.file_download_interval,
             self.config.filename_limit,
+            self.config.empty_tag_action,
         )
         self.window.set_summary(
             self.config.save_root,
@@ -140,6 +144,7 @@ class AppController(QObject):
             "max_posts": self.config.max_posts,
             "preview_max_results": self.config.preview_max_results,
             "concurrency": self.config.concurrency,
+            "chunk_concurrency": self.config.chunk_concurrency,
             "file_download_interval": self.config.file_download_interval,
             "filename_limit": self.config.filename_limit,
             "empty_tag_action": self.config.empty_tag_action,
@@ -212,13 +217,22 @@ class AppController(QObject):
         w.open_log_folder_requested.connect(self.open_log_folder)
         w.history_clear_requested.connect(self.clear_history)
         w.history_delete_requested.connect(self.delete_history)
+        w.history_open_folder_requested.connect(self.open_specific_folder)
         w.trend_period_changed.connect(self.refresh_trend)
         w.window_closing.connect(self.shutdown)
         w.task_page.open_current_folder_requested.connect(self.open_specific_folder)
 
     def open_specific_folder(self, path_str: str) -> None:
-        path = Path(path_str).expanduser().resolve()
-        path.mkdir(parents=True, exist_ok=True)
+        raw_path = str(path_str or "").strip()
+        if not raw_path:
+            self.window.show_error("请先选择目录")
+            return
+        try:
+            path = Path(raw_path).expanduser().resolve()
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.window.show_error(f"无法打开目录：{exc}")
+            return
         QDesktopServices.openUrl(path.as_uri())
 
     @staticmethod
@@ -857,6 +871,9 @@ class AppController(QObject):
             mode = self.config.save_mode
         if mode not in SAVE_MODE_LABELS:
             mode = self.config.save_mode if self.config.save_mode in SAVE_MODE_LABELS else "tag"
+        if not str(params.get("tag", "") or "").strip() and self.config.empty_tag_action == "skip":
+            self.window.show_error("当前设置为 Tag 为空时跳过；请填写 Tag 或在设置中更改空 Tag 处理方式")
+            return
         duplicate_mode = "skip" if params.get("skip_duplicates", True) else self.config.duplicate_mode
         if duplicate_mode == "skip" and not params.get("skip_duplicates", True):
             duplicate_mode = "rename"
@@ -885,7 +902,7 @@ class AppController(QObject):
             filename_limit=max(20, int(self.config.filename_limit)),
             empty_tag_action=self.config.empty_tag_action,
             custom_extract_json=str(params.get("custom_extract_json", "")).strip(),
-            chunk_concurrency=max(1, int(getattr(self.config, "chunk_concurrency", 1))),
+            chunk_concurrency=max(1, min(8, int(self.config.chunk_concurrency))),
             save_extended_info=bool(params.get("save_extended_info", False)),
             date_from=str(params.get("date_from", "") or ""),
             date_to=str(params.get("date_to", "") or ""),
@@ -927,9 +944,17 @@ class AppController(QObject):
         if params.get("save_mode") and params["save_mode"] != "default":
             self.config.save_mode = params["save_mode"]
         self.config.save_extended_info = bool(params.get("save_extended_info", False))
+        self.config.open_after_download = bool(params.get("open_after", False))
+        if bool(params.get("skip_duplicates", True)):
+            self.config.duplicate_mode = "skip"
+            self.config.skip_duplicates = True
+        else:
+            if self.config.duplicate_mode == "skip":
+                self.config.duplicate_mode = "rename"
+            self.config.skip_duplicates = False
         state = dict(self.config.last_task_state or {})
-        state["channel"] = state.get("channel", self.config.channel)
-        state["tag"] = state.get("tag", self.config.tag)
+        state["channel"] = params.get("channel") or state.get("channel", self.config.channel)
+        state["tag"] = params.get("tag") or state.get("tag", self.config.tag)
         state["params"] = dict(params)
         self.config.last_task_state = state
         self.config.save()
@@ -939,11 +964,53 @@ class AppController(QObject):
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode,
             self.config.save_extended_info,
+            self.config.open_after_download,
+            self.config.duplicate_mode == "skip",
+        )
+        self.window.set_task_rule_summary(
+            self.config.filename_template,
+            self.config.preserve_original_name,
+            self.config.duplicate_mode,
+            self.config.open_after_download,
+            self.config.concurrency,
+            self.config.chunk_concurrency,
+            self.config.file_download_interval,
+            self.config.filename_limit,
+            self.config.empty_tag_action,
+        )
+        self.window.set_settings_defaults(self._settings_dict())
+        self.window.set_summary(
+            self.config.save_root,
+            SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
         )
 
     def save_advanced_rules(self, rules: list[dict]) -> None:
         self.config.advanced_rules = rules
         self.config.save()
+
+    @staticmethod
+    def _resumable_post_ids(state: dict) -> list[int]:
+        post_statuses = dict(state.get("post_statuses", {}) or {})
+        raw_ids = list(state.get("post_ids", []) or [])
+        if post_statuses:
+            raw_ids = [*raw_ids, *post_statuses.keys()]
+        result: list[int] = []
+        seen: set[int] = set()
+        for item in raw_ids:
+            try:
+                post_id = int(item)
+            except (TypeError, ValueError):
+                continue
+            status = str(
+                post_statuses.get(str(post_id), post_statuses.get(post_id, ""))
+                or ""
+            )
+            if post_statuses and status.startswith("已完成"):
+                continue
+            if post_id not in seen:
+                seen.add(post_id)
+                result.append(post_id)
+        return result
 
     def resume_last_task(self) -> None:
         """继续上次任务"""
@@ -960,7 +1027,11 @@ class AppController(QObject):
         params = dict(state.get("params", {}) or {})
         params["channel"] = state.get("channel") or params.get("channel", "")
         params["tag"] = state.get("tag") or params.get("tag", "")
-        params["resume_post_ids"] = state.get("post_ids", [])
+        resume_post_ids = self._resumable_post_ids(state)
+        params["resume_post_ids"] = resume_post_ids
+        if (state.get("post_statuses") or state.get("status") == "已完成") and not resume_post_ids:
+            self.window.show_info("上次任务没有未完成帖子，已恢复配置；需要重跑可手动开始")
+            return
         if not self.authorized:
             self.window.show_info("已恢复上次任务配置；登录 Telegram 后可继续下载")
             self.window.navigate_to_login()
@@ -1241,6 +1312,7 @@ class AppController(QObject):
                     "downloaded": downloaded,
                     "skipped": skipped,
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "save_root": str(self.current_request.save_root),
                 }
             )
         self._refresh_local_data()
@@ -1280,9 +1352,21 @@ class AppController(QObject):
                     "downloaded": downloaded,
                     "skipped": skipped,
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "save_root": str(self.current_request.save_root),
                 }
             )
             self._refresh_local_data()
+        if self.config.last_task_state:
+            state = dict(self.config.last_task_state)
+            state.update(
+                {
+                    "status": "失败",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "error": message,
+                }
+            )
+            self.config.last_task_state = state
+            self.config.save()
         self._refresh_log_view()
         if not self._discard_current_task:
             self.window.show_error(f"任务失败：{message}")
@@ -1309,6 +1393,10 @@ class AppController(QObject):
             10, int(values.get("preview_max_results", self.config.preview_max_results))
         )
         self.config.concurrency = max(1, int(values.get("concurrency", self.config.concurrency)))
+        self.config.chunk_concurrency = max(
+            1,
+            min(8, int(values.get("chunk_concurrency", self.config.chunk_concurrency))),
+        )
         self.config.file_download_interval = max(
             0.0, float(values.get("file_download_interval", self.config.file_download_interval))
         )
@@ -1362,6 +1450,8 @@ class AppController(QObject):
             SAVE_MODE_LABELS.get(self.config.save_mode, self.config.save_mode),
             self.config.save_mode,
             self.config.save_extended_info,
+            self.config.open_after_download,
+            self.config.duplicate_mode == "skip",
         )
         self.window.set_task_rule_summary(
             self.config.filename_template,
@@ -1369,8 +1459,10 @@ class AppController(QObject):
             self.config.duplicate_mode,
             self.config.open_after_download,
             self.config.concurrency,
+            self.config.chunk_concurrency,
             self.config.file_download_interval,
             self.config.filename_limit,
+            self.config.empty_tag_action,
         )
         self.window.set_summary(
             self.config.save_root,
@@ -1421,9 +1513,7 @@ class AppController(QObject):
         self.window.show_success("历史记录已删除")
 
     def open_folder(self) -> None:
-        path = Path(self.config.save_root).expanduser().resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(path.as_uri())
+        self.open_specific_folder(self.config.save_root)
 
     def open_log(self) -> None:
         path = self.logger.get_log_path().resolve()
@@ -1491,6 +1581,7 @@ class AppController(QObject):
                     int(item.get("posts", 0)),
                     int(item.get("downloaded", 0)),
                     item.get("time", "-"),
+                    str(item.get("save_root", "") or ""),
                 )
                 for item in history
             ]

@@ -460,13 +460,14 @@ class TaskRow:
 
 class HistoryRow:
     def __init__(self, channel: str, tag: str, status: str,
-                 posts: int, downloaded: int, time: str):
+                 posts: int, downloaded: int, time: str, save_root: str = ""):
         self.channel = channel
         self.tag = tag
         self.status = status
         self.posts = posts
         self.downloaded = downloaded
         self.time = time
+        self.save_root = save_root
 
 
 # ──────────────────────────────────────────────────────────────
