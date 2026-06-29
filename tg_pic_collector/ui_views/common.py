@@ -828,13 +828,16 @@ class SearchPreviewDialog(MessageBoxBase):
     """Fluent-style browser for matched posts and comment image thumbnails."""
 
     cancel_requested = Signal()
-    download_requested = Signal()
+    download_requested = Signal(list)
 
     def __init__(self, channel: str, tag: str, parent=None):
         super().__init__(parent)
         self.widget.setMinimumSize(960, 680)
         self.widget.setMaximumSize(1120, 820)
         self._ready = False
+        self._preview_rows: list[dict] = []
+        self._selected_post_ids: set[int] = set()
+        self._selection_widgets: dict[int, CheckBox] = {}
         self.yesButton.setText("直接下载")
         self.yesButton.setEnabled(False)
         self.cancelButton.setText("取消搜索")
@@ -857,6 +860,17 @@ class SearchPreviewDialog(MessageBoxBase):
 
         self._status = BodyLabel("正在准备搜索…")
         self.viewLayout.addWidget(self._status)
+        select_row = QHBoxLayout()
+        select_row.setSpacing(8)
+        self._selection_status = _muted("默认全选预览结果", wrap=False)
+        self._toggle_all_btn = PushButton("全不选", icon=FIF.ACCEPT)
+        self._toggle_all_btn.setMinimumHeight(32)
+        self._toggle_all_btn.hide()
+        self._toggle_all_btn.clicked.connect(self._toggle_all_selection)
+        select_row.addWidget(self._selection_status)
+        select_row.addStretch()
+        select_row.addWidget(self._toggle_all_btn)
+        self.viewLayout.addLayout(select_row)
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)
         self._progress.setTextVisible(False)
@@ -881,20 +895,31 @@ class SearchPreviewDialog(MessageBoxBase):
     def set_results(self, rows: list[dict], total_count: int, display_limit: int):
         self._progress.hide()
         self._ready = True
-        self.yesButton.setEnabled(bool(rows))
         self.cancelButton.setText("关闭")
         self._clear_results()
+        self._preview_rows = list(rows)
+        self._selected_post_ids = {
+            post_id
+            for post_id in (self._post_id_from_row(row) for row in rows)
+            if post_id >= 0
+        }
+        self._selection_widgets = {}
+        self._toggle_all_btn.setVisible(bool(rows))
         image_total = sum(int(row.get("image_count", 0)) for row in rows)
+        webpage_total = sum(int(row.get("webpage_count", 0)) for row in rows)
+        asset_summary = f"评论区共发现 {image_total} 张图片"
+        if webpage_total:
+            asset_summary += f"，Telegraph 漫画页 {webpage_total} 个"
         hidden_count = max(0, total_count - len(rows))
         if hidden_count:
             self._status.setText(
                 f"本次扫描范围内共找到 {total_count} 篇帖子，当前展示 {len(rows)} 篇，"
-                f"还有 {hidden_count} 篇未展示；已展示帖子评论区共发现 {image_total} 张图片"
+                f"还有 {hidden_count} 篇未展示；已展示帖子{asset_summary}"
             )
         elif rows:
             self._status.setText(
                 f"本次扫描范围内共找到 {total_count} 篇帖子，"
-                f"评论区共发现 {image_total} 张图片"
+                f"{asset_summary}"
             )
         else:
             self._status.setText("没有找到匹配的帖子")
@@ -912,17 +937,35 @@ class SearchPreviewDialog(MessageBoxBase):
             ))
             notice.body.addWidget(_muted(
                 f"本次共找到 {total_count} 篇，还有 {hidden_count} 篇未展示。"
-                "正式下载仍会按照默认扫描帖子数量完整处理。"
+                "直接下载只处理当前已展示且已勾选的帖子；手动开始任务仍按默认范围处理。"
             ))
             self._results_layout.addWidget(notice)
 
         for row in rows:
             card = SurfaceCard()
+            post_id = self._post_id_from_row(row)
+            card.setProperty("previewPostId", post_id)
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.installEventFilter(self)
             top = QHBoxLayout()
             top.addWidget(StrongBodyLabel(f"帖子 #{row.get('post_id', '-')}"))
             top.addWidget(_muted(str(row.get("channel", "")), wrap=False))
             top.addStretch()
             top.addWidget(_muted(str(row.get("date", "-")), wrap=False))
+            select_cb = CheckBox("下载")
+            select_cb.setChecked(post_id in self._selected_post_ids)
+            select_cb.setEnabled(post_id >= 0)
+            select_cb.setToolTip("勾选后点击直接下载会处理这篇帖子。也可以点击卡片右侧空白区域切换。")
+            if post_id >= 0:
+                select_cb.stateChanged.connect(
+                    lambda _state=0, pid=post_id: self._set_row_selected(
+                        pid,
+                        self._selection_widgets[pid].isChecked(),
+                        sync_widget=False,
+                    )
+                )
+                self._selection_widgets[post_id] = select_cb
+            top.addWidget(select_cb)
             card.body.addLayout(top)
 
             text = str(row.get("text", "")).strip() or "该帖子没有文字内容"
@@ -933,11 +976,14 @@ class SearchPreviewDialog(MessageBoxBase):
             text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             card.body.addWidget(text_label)
 
+            webpage_count = int(row.get("webpage_count", 0))
             meta = (
                 f"浏览 {int(row.get('views', 0)):,}  ·  "
                 f"评论 {int(row.get('replies', 0)):,}  ·  "
                 f"评论区图片 {int(row.get('image_count', 0)):,}"
             )
+            if webpage_count:
+                meta += f"  ·  Telegraph 漫画页 {webpage_count:,}"
             card.body.addWidget(_muted(meta))
 
             hit_sources = [str(item) for item in (row.get("hit_sources") or []) if item]
@@ -996,6 +1042,7 @@ class SearchPreviewDialog(MessageBoxBase):
                 card.body.addWidget(_muted("图片没有可用缩略图，下载任务仍可保存原图。"))
 
             self._results_layout.addWidget(card)
+        self._update_selection_ui()
 
     def set_error(self, message: str):
         self._progress.hide()
@@ -1015,15 +1062,82 @@ class SearchPreviewDialog(MessageBoxBase):
             if item.widget():
                 item.widget().deleteLater()
 
+    def _toggle_all_selection(self):
+        all_ids = {
+            post_id
+            for post_id in (self._post_id_from_row(row) for row in self._preview_rows)
+            if post_id >= 0
+        }
+        self._selected_post_ids = set() if self._selected_post_ids else all_ids
+        for post_id, widget in self._selection_widgets.items():
+            widget.blockSignals(True)
+            widget.setChecked(post_id in self._selected_post_ids)
+            widget.blockSignals(False)
+        self._update_selection_ui()
+
+    def _set_row_selected(self, post_id: int, selected: bool, *, sync_widget: bool = True):
+        if post_id < 0:
+            return
+        if selected:
+            self._selected_post_ids.add(post_id)
+        else:
+            self._selected_post_ids.discard(post_id)
+        if sync_widget and post_id in self._selection_widgets:
+            widget = self._selection_widgets[post_id]
+            widget.blockSignals(True)
+            widget.setChecked(selected)
+            widget.blockSignals(False)
+        self._update_selection_ui()
+
+    @staticmethod
+    def _post_id_from_row(row: dict) -> int:
+        try:
+            return int(row.get("post_id"))
+        except (TypeError, ValueError):
+            return -1
+
+    def _toggle_row_selection(self, post_id: int):
+        self._set_row_selected(post_id, post_id not in self._selected_post_ids)
+
+    def _update_selection_ui(self):
+        selected = len(self._selected_post_ids)
+        total = len(self._preview_rows)
+        if total:
+            self._selection_status.setText(f"已选择 {selected} / {total} 篇")
+        else:
+            self._selection_status.setText("默认全选预览结果")
+        self._toggle_all_btn.setText("全不选" if selected else "全选")
+        self.yesButton.setText(f"下载选中 {selected}" if selected else "直接下载")
+        self.yesButton.setEnabled(getattr(self, "_ready", False) and selected > 0)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            getattr(self, "_ready", False)
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and watched.property("previewPostId") is not None
+        ):
+            try:
+                post_id = int(watched.property("previewPostId"))
+            except (TypeError, ValueError):
+                return super().eventFilter(watched, event)
+            if hasattr(event, "position"):
+                x = event.position().x()
+            else:
+                x = event.pos().x()
+            if x >= max(0, watched.width() - 180):
+                self._toggle_row_selection(post_id)
+                return True
+        return super().eventFilter(watched, event)
+
     def accept(self):
-        if self._ready:
-            self.download_requested.emit()
+        if getattr(self, "_ready", False):
+            self.download_requested.emit(sorted(self._selected_post_ids))
         else:
             self.cancel_requested.emit()
         super().accept()
 
     def reject(self):
-        if not self._ready:
+        if not getattr(self, "_ready", False):
             self.cancel_requested.emit()
         super().reject()
 

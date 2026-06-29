@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
+
+from .store import AppStore
 
 
 DEFAULT_SAVE_ROOT = str(Path.home() / "Pictures" / "TG Pic Collector")
@@ -17,6 +19,13 @@ DEFAULT_CONCURRENCY = 6
 DEFAULT_CHUNK_CONCURRENCY = 1
 DEFAULT_FILE_DOWNLOAD_INTERVAL = 0.5
 DEFAULT_FILENAME_LIMIT = 100
+STORE_BACKED_FIELDS = {
+    "history",
+    "yande_tag_history",
+    "last_task_state",
+    "channel_history",
+    "account_sessions",
+}
 WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -34,6 +43,15 @@ def _safe_fs_name(value: str, fallback: str = "default") -> str:
     if name.upper() in WINDOWS_RESERVED_NAMES:
         name = f"_{name}"
     return name
+
+
+def _stable_json(value) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 @dataclass
@@ -68,19 +86,20 @@ class AppConfig:
     enable_animations: bool = True
     enable_rounded_corners: bool = True
     enable_system_notifications: bool = True
-    close_behavior: str = "ask"  # ask | minimize | exit
+    close_behavior: str = "ask"
     remember_close_behavior: bool = False
     use_dpapi_encryption: bool = True
     save_extended_info: bool = False
+    save_telegraph_images: bool = False
     yande_cookie: str = ""
     yande_tags: str = ""
     yande_tag_history: list[str] | None = None
     use_system_proxy: bool = True
     proxy_url: str = ""
     last_task_state: dict | None = None
-    channel_history: list[dict] | None = None  # [{"name": "频道名", "id": "@username", "link": "https://t.me/xxx", "avatar_path": "..."}]
-    advanced_rules: list[dict] | None = None  # [{"name": str, "description": str, "json": str}]
-    account_sessions: list[dict] | None = None  # [{"key": str, "session_name": str, "name": str, "phone": str, "avatar_path": "..."}]
+    channel_history: list[dict] | None = None
+    advanced_rules: list[dict] | None = None
+    account_sessions: list[dict] | None = None
 
     @property
     def config_dir(self) -> Path:
@@ -103,25 +122,89 @@ class AppConfig:
     def current_account_key(self) -> str:
         return self.account_key(self.session_name, self.session_dir)
 
+    @property
+    def store(self) -> AppStore:
+        store = self.__dict__.get("_store")
+        if store is None:
+            store = AppStore(self.config_dir / "app_state.sqlite3")
+            self.__dict__["_store"] = store
+        return store
+
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        payload = asdict(self)
+        self.save_runtime_fields(*STORE_BACKED_FIELDS)
+        payload = {
+            key: value
+            for key, value in asdict(self).items()
+            if key not in STORE_BACKED_FIELDS
+        }
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
         config_path = self.config_dir / "config.json"
+        try:
+            if config_path.exists() and config_path.read_text(encoding="utf-8") == content:
+                return
+        except OSError:
+            pass
         tmp_path = config_path.with_name(f"{config_path.name}.tmp")
         tmp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
+            content,
             encoding="utf-8",
         )
         tmp_path.replace(config_path)
 
+    def save_runtime_fields(self, *fields: str) -> None:
+        for field_name in fields:
+            if not self._runtime_field_changed(field_name):
+                continue
+            if field_name == "history" and self.history is not None:
+                self.history = self.store.replace_history(self.history)
+            elif field_name == "yande_tag_history" and self.yande_tag_history is not None:
+                self.yande_tag_history = self.store.replace_yande_tag_history(
+                    self.yande_tag_history
+                )
+            elif field_name == "channel_history" and self.channel_history is not None:
+                self.channel_history = self.store.replace_channel_cache(
+                    self.channel_history
+                )
+            elif field_name == "account_sessions" and self.account_sessions is not None:
+                self.account_sessions = self.store.replace_account_sessions(
+                    self.account_sessions
+                )
+            elif field_name == "last_task_state":
+                self.store.set_runtime_state("last_task_state", self.last_task_state)
+            self._mark_runtime_field_clean(field_name)
+
+    def _runtime_field_changed(self, field_name: str) -> bool:
+        signatures = self.__dict__.setdefault("_runtime_signatures", {})
+        return signatures.get(field_name) != _stable_json(
+            getattr(self, field_name, None)
+        )
+
+    def _mark_runtime_field_clean(self, field_name: str) -> None:
+        signatures = self.__dict__.setdefault("_runtime_signatures", {})
+        signatures[field_name] = _stable_json(getattr(self, field_name, None))
+
+    def load_runtime_state(self) -> None:
+        self.history = self.store.list_history()
+        self.yande_tag_history = self.store.list_yande_tag_history()
+        self.channel_history = self.store.list_channel_cache()
+        self.account_sessions = self.store.list_account_sessions()
+        state = self.store.get_runtime_state("last_task_state")
+        if state is not None:
+            self.last_task_state = state
+        for field_name in STORE_BACKED_FIELDS:
+            self._mark_runtime_field_clean(field_name)
+
     def add_history(self, record: dict) -> None:
-        history = list(self.history or [])
-        history.insert(0, record)
-        self.history = history[:100]
-        self.save()
+        self.history = self.store.add_history(record, limit=100)
+        self._mark_runtime_field_clean("history")
 
     def add_yande_tag_history(self, tags: str) -> None:
-        values = [part.strip("# ") for part in re.split(r"[\s,]+", tags or "") if part.strip("# ")]
+        values = [
+            part.strip("# ")
+            for part in re.split(r"[\s,]+", tags or "")
+            if part.strip("# ")
+        ]
         if not values:
             return
         history = list(self.yande_tag_history or [])
@@ -129,8 +212,10 @@ class AppConfig:
             if tag in history:
                 history.remove(tag)
             history.insert(0, tag)
-        self.yande_tag_history = history[:30]
-        self.save()
+        self.yande_tag_history = self.store.replace_yande_tag_history(
+            history[:30]
+        )
+        self._mark_runtime_field_clean("yande_tag_history")
 
     def add_channel_to_history(
         self,
@@ -139,18 +224,15 @@ class AppConfig:
         avatar_bytes: bytes = b"",
         channel_link: str = "",
     ) -> None:
-        """添加频道到历史记录"""
         history = list(self.channel_history or [])
         channel_id = str(channel_id or "").strip()
         channel_name = str(channel_name or "").strip()
         channel_link = str(channel_link or "").strip() or self._channel_display_link(channel_id)
         if not channel_id:
             return
-        
-        # 检查是否已存在
+
         for index, item in enumerate(history):
             if item.get("id") == channel_id:
-                # 更新已存在的记录
                 item["name"] = channel_name or item.get("name", "")
                 item["link"] = channel_link or item.get("link", "")
                 if avatar_bytes:
@@ -158,27 +240,31 @@ class AppConfig:
                     if avatar_path:
                         item["avatar_path"] = avatar_path
                         item["avatar_updated_at"] = datetime.now().isoformat(timespec="seconds")
-                # 最近搜索过的频道放到最前面，方便下次直接选。
                 history.insert(0, history.pop(index))
-                self.channel_history = history[:20]
-                self.save()
+                self.channel_history = self.store.replace_channel_cache(
+                    history[:20]
+                )
+                self._mark_runtime_field_clean("channel_history")
                 return
-        
-        # 保存头像到本地
+
         avatar_path = ""
         if avatar_bytes:
             avatar_path = self._save_channel_avatar(channel_id, avatar_bytes)
-        
-        # 添加新记录
-        history.insert(0, {
-            "id": channel_id,
-            "name": channel_name,
-            "link": channel_link,
-            "avatar_path": avatar_path,
-            "avatar_updated_at": datetime.now().isoformat(timespec="seconds") if avatar_path else "",
-        })
-        self.channel_history = history[:20]  # 最多保存20个频道
-        self.save()
+
+        history.insert(
+            0,
+            {
+                "id": channel_id,
+                "name": channel_name,
+                "link": channel_link,
+                "avatar_path": avatar_path,
+                "avatar_updated_at": datetime.now().isoformat(timespec="seconds")
+                if avatar_path
+                else "",
+            },
+        )
+        self.channel_history = self.store.replace_channel_cache(history[:20])
+        self._mark_runtime_field_clean("channel_history")
 
     @staticmethod
     def _channel_display_link(channel_id: str) -> str:
@@ -187,20 +273,14 @@ class AppConfig:
         if channel_id.startswith("-100") and channel_id[4:].isdigit():
             return f"https://t.me/c/{channel_id[4:]}"
         return channel_id
-    
+
     def _save_channel_avatar(self, channel_id: str, avatar_bytes: bytes) -> str:
-        """保存频道头像到本地，返回相对路径"""
         if not avatar_bytes:
             return ""
-
-        # 创建头像缓存目录
         avatar_dir = self.config_dir / "channel_avatars"
         avatar_dir.mkdir(parents=True, exist_ok=True)
-
-        # 使用频道ID作为文件名（安全化）
         safe_id = _safe_fs_name(re.sub(r"[@-]", "_", channel_id), "channel")
         avatar_path = avatar_dir / f"{safe_id}.jpg"
-
         try:
             avatar_path.write_bytes(avatar_bytes)
             return str(avatar_path)
@@ -241,13 +321,15 @@ class AppConfig:
                         merged[field] = value
                 sessions.insert(0, sessions.pop(index))
                 sessions[0] = merged
-                self.account_sessions = sessions[:12]
-                self.save()
+                self.account_sessions = self.store.replace_account_sessions(
+                    sessions[:12]
+                )
+                self._mark_runtime_field_clean("account_sessions")
                 return
 
         sessions.insert(0, payload)
-        self.account_sessions = sessions[:12]
-        self.save()
+        self.account_sessions = self.store.replace_account_sessions(sessions[:12])
+        self._mark_runtime_field_clean("account_sessions")
 
     def remove_account_session(self, key: str) -> bool:
         sessions = list(self.account_sessions or [])
@@ -266,7 +348,10 @@ class AppConfig:
             kept.append(item)
         self.account_sessions = kept
         if removed:
-            self.save()
+            self.account_sessions = self.store.replace_account_sessions(
+                self.account_sessions
+            )
+            self._mark_runtime_field_clean("account_sessions")
         return removed
 
     def _save_account_avatar(self, key: str, avatar_bytes: bytes) -> str:
@@ -306,13 +391,10 @@ class AppConfig:
                 }
             )
         return result
-    
+
     def get_channel_history_with_avatars(self) -> list[dict]:
-        """获取频道历史记录，包含头像字节数据"""
-        history = list(self.channel_history or [])
         result = []
-        
-        for item in history:
+        for item in list(self.channel_history or []):
             avatar_bytes = b""
             avatar_path = item.get("avatar_path", "")
             if avatar_path:
@@ -322,14 +404,15 @@ class AppConfig:
                         avatar_bytes = path.read_bytes()
                 except OSError:
                     pass
-            
-            result.append({
-                "id": item.get("id", ""),
-                "name": item.get("name", ""),
-                "link": item.get("link", "") or self._channel_display_link(str(item.get("id", ""))),
-                "avatar": avatar_bytes,
-            })
-        
+            result.append(
+                {
+                    "id": item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "link": item.get("link", "")
+                    or self._channel_display_link(str(item.get("id", ""))),
+                    "avatar": avatar_bytes,
+                }
+            )
         return result
 
     @classmethod
@@ -337,12 +420,21 @@ class AppConfig:
         probe = cls()
         path = probe.config_dir / "config.json"
         if not path.exists():
+            probe.load_runtime_state()
             return probe
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if "file_download_interval" not in payload and "request_interval" in payload:
                 payload["file_download_interval"] = payload["request_interval"]
-            valid = {key: value for key, value in payload.items() if key in cls.__dataclass_fields__}
-            return cls(**valid)
+            valid = {
+                key: value
+                for key, value in payload.items()
+                if key in cls.__dataclass_fields__
+            }
+            config = cls(**valid)
+            config.store.migrate_from_config_payload(payload)
+            config.load_runtime_state()
+            return config
         except (OSError, ValueError, TypeError):
+            probe.load_runtime_state()
             return probe

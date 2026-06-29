@@ -24,6 +24,12 @@ DEFAULT_ADVANCED_RULE_CONFIG = {
     },
 }
 
+RESOURCE_MODE_OPTIONS = (
+    ("帖子图片", "images"),
+    ("Telegraph 漫画", "comics"),
+    ("图片 + 漫画", "both"),
+)
+
 
 def _default_advanced_json() -> str:
     return json.dumps(DEFAULT_ADVANCED_RULE_CONFIG, indent=2, ensure_ascii=False)
@@ -207,6 +213,18 @@ class TaskPage(ScrollPage):
         opts_col = QVBoxLayout()
         opts_col.setSpacing(8)
 
+        resource_row = QHBoxLayout()
+        resource_row.setSpacing(12)
+        resource_row.addWidget(BodyLabel("下载内容"))
+        self.resource_mode_combo = ComboBox()
+        self.resource_mode_combo.setMinimumWidth(190)
+        for label, value in RESOURCE_MODE_OPTIONS:
+            self.resource_mode_combo.addItem(label, userData=value)
+        self.resource_mode_combo.setCurrentIndex(0)
+        self.resource_mode_combo.currentIndexChanged.connect(self._sync_resource_mode_controls)
+        resource_row.addWidget(self.resource_mode_combo)
+        resource_row.addStretch()
+
         # 第一排：常规勾选项
         opts_row1 = QHBoxLayout()
         opts_row1.setSpacing(24)
@@ -237,9 +255,7 @@ class TaskPage(ScrollPage):
         self.btn_keyword_edit.setMinimumSize(160, 32)
 
         # 简单的 UI 交互：勾选才启用输入框
-        self.extract_btn_cb.stateChanged.connect(
-            lambda: self.btn_keyword_edit.setEnabled(self.extract_btn_cb.isChecked())
-        )
+        self.extract_btn_cb.stateChanged.connect(self._sync_resource_mode_controls)
 
         opts_row2.addWidget(self.extract_btn_cb)
         opts_row2.addWidget(self.btn_keyword_edit)
@@ -247,13 +263,14 @@ class TaskPage(ScrollPage):
 
         opts_row3 = QHBoxLayout()
         opts_row3.setSpacing(12)
-        self.save_ext_info_cb = CheckBox("保存图片扩展信息（IGP sidecar）")
+        self.save_ext_info_cb = CheckBox("保存扩展信息（IGP sidecar）")
         self.save_ext_info_cb.setToolTip(
             "下载成功后在图片旁边生成 .igp.json，保存 Tag、来源帖子、媒体 ID 等信息。"
         )
         opts_row3.addWidget(self.save_ext_info_cb)
         opts_row3.addStretch()
 
+        opts_col.addLayout(resource_row)
         opts_col.addLayout(opts_row1)
         opts_col.addLayout(opts_row2)
         opts_col.addLayout(opts_row3)
@@ -348,6 +365,7 @@ class TaskPage(ScrollPage):
         self.tag_edit.textChanged.connect(self._update_tag_empty_notice)
         self._apply_notice_styles()
         self._update_tag_empty_notice()
+        self._sync_resource_mode_controls()
 
         form_card.body.addLayout(form)
         body.addWidget(form_card, 3)
@@ -409,11 +427,41 @@ class TaskPage(ScrollPage):
         idx = self.channel_combo.findText(text)
         if idx >= 0:
             return self.channel_combo.itemData(idx) or text
+        idx = self._find_channel_item(text)
+        if idx >= 0:
+            return self.channel_combo.itemData(idx) or text
         # 如果是用户纯手打的，直接返回手打文字
         normalized = normalize_channel_reference(text)
         if normalized and normalized != text:
             self.channel_combo.setText(normalized)
         return normalized
+
+    def _find_channel_item(self, value: str) -> int:
+        value = str(value or "").strip()
+        if not value:
+            return -1
+        normalized = normalize_channel_reference(value)
+        for index in range(self.channel_combo.count()):
+            item_text = str(self.channel_combo.itemText(index) or "").strip()
+            item_data = str(self.channel_combo.itemData(index) or "").strip()
+            if value in {item_text, item_data} or normalized and normalized == item_data:
+                return index
+        return -1
+
+    @staticmethod
+    def _channel_display_text(channel: dict) -> str:
+        name = str(channel.get("name", "") or "").strip()
+        channel_id = str(channel.get("id", "") or "").strip()
+        link = str(channel.get("link", "") or channel_id).strip()
+        return f"{name}  ·  {link}" if name and link else (link or name or channel_id)
+
+    def set_channel_value(self, value: str) -> None:
+        idx = self._find_channel_item(value)
+        if idx >= 0:
+            self.channel_combo.setText(self.channel_combo.itemText(idx))
+        else:
+            self.channel_combo.setText(str(value or "").strip())
+
     def _choose_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择图片保存位置", self.path_edit.text())
         if d:
@@ -491,6 +539,7 @@ class TaskPage(ScrollPage):
             "tag": self.tag_edit.text().strip(),
             "save_root": self.path_edit.text().strip(),
             "save_mode": self.mode_combo.currentData(),
+            "resource_mode": self.resource_mode_combo.currentData() or "images",
             "only_images": self.only_images_cb.isChecked(),
             "skip_duplicates": self.skip_dup_cb.isChecked(),
             "include_replies": self.include_replies_cb.isChecked(),
@@ -508,6 +557,20 @@ class TaskPage(ScrollPage):
             params["date_from"] = start.toString("yyyy-MM-dd")
             params["date_to"] = end.toString("yyyy-MM-dd")
         return params
+
+    def _sync_resource_mode_controls(self, *_):
+        mode = self.resource_mode_combo.currentData() if hasattr(self, "resource_mode_combo") else "images"
+        image_enabled = mode in {"images", "both", None, ""}
+        if hasattr(self, "only_images_cb"):
+            self.only_images_cb.setEnabled(image_enabled)
+        if hasattr(self, "extract_btn_cb"):
+            self.extract_btn_cb.setEnabled(image_enabled)
+        if hasattr(self, "btn_keyword_edit"):
+            self.btn_keyword_edit.setEnabled(
+                image_enabled
+                and hasattr(self, "extract_btn_cb")
+                and self.extract_btn_cb.isChecked()
+            )
 
     def _show_channel_menu(self):
         """显示频道选择菜单"""
@@ -591,6 +654,9 @@ class TaskPage(ScrollPage):
         idx = self.mode_combo.findData(self._default_mode_key)
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
+        resource_idx = self.resource_mode_combo.findData("images")
+        if resource_idx >= 0:
+            self.resource_mode_combo.setCurrentIndex(resource_idx)
         self.only_images_cb.setChecked(True)
         self.skip_dup_cb.setChecked(self._default_skip_duplicates)
         self.include_replies_cb.setChecked(True)
@@ -602,6 +668,7 @@ class TaskPage(ScrollPage):
         self._adv_json_badge.setText(
             f"已启用：{DEFAULT_ADVANCED_RULE_NAME} · 已接管链接追踪"
         )
+        self._sync_resource_mode_controls()
 
     # ── Setters
     def set_account(self, name: str = "", phone: str = "", dc: str = ""):
@@ -679,12 +746,15 @@ class TaskPage(ScrollPage):
 
     def restore_last_params(self, channel: str, tag: str):
         """恢复上次的任务参数"""
-        self.channel_combo.setText(channel)  # ✨ 换成 combo 的 setText
+        self.set_channel_value(channel)
         self.tag_edit.setText(tag)
 
     def restore_task_options(self, params: dict):
         """恢复上一次实际执行任务时使用的本次选项。"""
         self.only_images_cb.setChecked(bool(params.get("only_images", True)))
+        resource_mode = str(params.get("resource_mode", "images") or "images")
+        resource_idx = self.resource_mode_combo.findData(resource_mode)
+        self.resource_mode_combo.setCurrentIndex(resource_idx if resource_idx >= 0 else 0)
         self.skip_dup_cb.setChecked(bool(params.get("skip_duplicates", True)))
         self.include_replies_cb.setChecked(bool(params.get("include_replies", True)))
         self.extract_btn_cb.setChecked(bool(params.get("extract_button_link", True)))
@@ -704,6 +774,7 @@ class TaskPage(ScrollPage):
             or _default_advanced_json()
         )
         self._update_advanced_badge(DEFAULT_ADVANCED_RULE_NAME)
+        self._sync_resource_mode_controls()
 
     def set_advanced_rules(self, rules: list[dict]):
         self._custom_advanced_rules = [
@@ -729,13 +800,11 @@ class TaskPage(ScrollPage):
             return
 
         for ch in channels[:20]:  # 最多显示20个频道
-            name = ch.get("name", "")
             ch_id = ch.get("id", "")
-            link = ch.get("link", "") or ch_id
             avatar_bytes = ch.get("avatar", b"")
 
             # 显示为：头像 + 名字 · 链接；真实下载参数仍通过 userData 保存。
-            display_text = f"{name}  ·  {link}" if name and link else (link or name or ch_id)
+            display_text = self._channel_display_text(ch)
 
             if avatar_bytes:
                 pixmap = QPixmap()
@@ -765,7 +834,7 @@ class TaskPage(ScrollPage):
             self.channel_combo.addItem(display_text, userData=ch_id)
 
         # 刷新候选项时 EditableComboBox 会自动选中第一项，恢复用户原本输入。
-        self.channel_combo.setText(current_text)
+        self.set_channel_value(current_text)
 
     def set_rule_summary(
         self,

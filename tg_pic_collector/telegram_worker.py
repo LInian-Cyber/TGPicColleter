@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import mimetypes
 import queue
 import re
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
-from telethon import TelegramClient, errors, types
+from telethon import TelegramClient, errors
 
 from .logger import get_logger
 from .igp import write_sidecar
@@ -24,17 +23,25 @@ from .models import (
     normalize_channel_reference,
 )
 from .network import proxy_label, telethon_proxy
+from .telegram_messages import (
+    is_downloadable_message,
+    is_image_message,
+    is_sticker_message,
+    is_webpage_preview,
+    message_document,
+    resolve_channel_entity,
+    safe_name,
+)
+from .telegram_media_index import DownloadedMediaIndex, media_key as build_media_key
+from .telegraph import (
+    download_telegraph_comic_async,
+    message_telegraph_links,
+    telegraph_page_key,
+    telegraph_slug,
+)
 
 
 PreviewCacheKey = tuple[str, str, str, str]
-WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{index}" for index in range(1, 10)),
-    *(f"LPT{index}" for index in range(1, 10)),
-}
 
 try:
     from .crypto import decrypt_session, encrypt_session
@@ -52,100 +59,6 @@ try:
     _HAS_EXTRACTOR = True
 except ImportError:
     _HAS_EXTRACTOR = False
-
-
-def safe_name(value: str, fallback: str = "untitled", max_length: int = 90) -> str:
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
-    value = value[:max_length].rstrip(" .")
-    if not value:
-        return fallback
-    if value.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
-        value = f"_{value}"
-    return value[:max_length].rstrip(" .") or fallback
-
-
-def is_webpage_preview(message: Any) -> bool:
-    """Return True for Telegram-generated link preview media."""
-    media = getattr(message, "media", None)
-    return bool(media and getattr(media, "webpage", None) is not None)
-
-
-def message_document(message: Any) -> Any | None:
-    media = getattr(message, "media", None)
-    return getattr(media, "document", None) or getattr(message, "document", None)
-
-
-def is_sticker_message(message: Any) -> bool:
-    document = message_document(message)
-    if not document:
-        return False
-    mime_type = str(getattr(document, "mime_type", "") or "").casefold()
-    attributes = getattr(document, "attributes", []) or []
-    attr_names = {type(attr).__name__ for attr in attributes}
-    if "DocumentAttributeSticker" in attr_names:
-        return True
-    if mime_type == "application/x-tgsticker":
-        return True
-    # Video stickers are usually webm documents with the animated flag.
-    return mime_type == "video/webm" and "DocumentAttributeAnimated" in attr_names
-
-
-def real_media_kind(message: Any) -> str | None:
-    """Identify only media actually uploaded to the Telegram message."""
-    media = getattr(message, "media", None)
-    if isinstance(media, types.MessageMediaPhoto) and getattr(media, "photo", None):
-        return "photo"
-    if isinstance(media, types.MessageMediaDocument) and getattr(media, "document", None):
-        return "document"
-    if getattr(message, "photo", None):
-        return "photo"
-    if getattr(message, "document", None):
-        return "document"
-    return None
-
-
-def is_image_message(message: Any) -> bool:
-    """检查消息是否为图片（排除贴纸）"""
-    if is_sticker_message(message):
-        return False
-    media_kind = real_media_kind(message)
-    if media_kind is None:
-        return False
-    if media_kind == "photo":
-        return True
-    document = message_document(message)
-    if not document:
-        return False
-
-    mime_type = str(getattr(document, "mime_type", "") or "")
-
-    return mime_type.startswith("image/")
-
-
-def is_downloadable_message(message: Any) -> bool:
-    return real_media_kind(message) is not None and not is_sticker_message(message)
-
-
-async def resolve_channel_entity(
-    client: TelegramClient, value: str
-) -> tuple[str, Any]:
-    """Resolve a channel reference, refreshing dialogs for uncached private channels."""
-    channel_ref = normalize_channel_reference(value)
-    entity_ref: str | int = (
-        int(channel_ref) if channel_ref.lstrip("-").isdigit() else channel_ref
-    )
-    try:
-        return channel_ref, await client.get_entity(entity_ref)
-    except ValueError as exc:
-        if not (isinstance(entity_ref, int) and channel_ref.startswith("-100")):
-            raise
-        await client.get_dialogs()
-        try:
-            return channel_ref, await client.get_entity(entity_ref)
-        except ValueError as retry_exc:
-            raise ValueError(
-                "无法访问该私密频道，请确认当前登录账号已加入，并在 Telegram 中打开过该频道。"
-            ) from retry_exc
 
 
 class TelegramWorker(QThread):
@@ -195,9 +108,7 @@ class TelegramWorker(QThread):
         self._preview_cache_limits: dict[PreviewCacheKey, int] = {}
         self._preview_cache_totals: dict[PreviewCacheKey, int] = {}
         self._preview_cache_requests: dict[PreviewCacheKey, tuple[Any, ...]] = {}
-        self._downloaded_media_keys: set[str] = set()
-        self._downloaded_media_paths: dict[str, str] = {}
-        self._downloaded_media_index_path: Path | None = None
+        self._media_index = DownloadedMediaIndex()
         self._thumbnail_cache: dict[str, tuple[float, bytes]] = {}
         self._thumbnail_cache_ttl = 24 * 60 * 60
         self._scan_retry_attempts: dict[tuple[str, str, str], int] = {}
@@ -643,10 +554,17 @@ class TelegramWorker(QThread):
         downloaded = 0
         skipped = 0
         planned_total = 0
+        resource_mode = str(getattr(request, "resource_mode", "images") or "images")
+        if resource_mode not in {"images", "comics", "both"}:
+            resource_mode = "images"
+        download_images = resource_mode in {"images", "both"}
+        download_comics = resource_mode in {"comics", "both"}
         scan_started_at = time.monotonic()
         last_metric_emit = 0.0
         semaphore = asyncio.Semaphore(max(1, request.concurrency))
-        download_queue: asyncio.Queue[tuple[int, Any, Path, str, dict[str, Any]] | None] = asyncio.Queue(
+        download_queue: asyncio.Queue[
+            tuple[str, int, Any, Path, str, dict[str, Any]] | None
+        ] = asyncio.Queue(
             maxsize=max(1, request.concurrency) * 3
         )
         download_workers: list[asyncio.Task[None]] = []
@@ -736,7 +654,9 @@ class TelegramWorker(QThread):
             self.logger.post_scanning(
                 post_id,
                 has_replies,
-                scan_links=bool(request.custom_extract_json) or request.extract_button_link,
+                scan_links=download_comics
+                or bool(request.custom_extract_json)
+                or request.extract_button_link,
                 scan_replies=request.include_replies,
             )
             self.post_status_changed.emit(post_id, "正在处理")
@@ -766,18 +686,35 @@ class TelegramWorker(QThread):
                 if item is None:
                     download_queue.task_done()
                     return
-                post_id, message, target, media_key, metadata_context = item
+                kind, post_id, message, target, media_key, metadata_context = item
                 try:
                     if self.cancel_event.is_set():
                         continue
-                    success = await self._download_media(
-                        client,
-                        message,
-                        target,
-                        semaphore,
-                        request.file_download_interval,
-                        chunk_concurrency=request.chunk_concurrency,
-                    )
+                    if kind == "telegraph":
+                        image_dir = Path(
+                            metadata_context.get("image_dir")
+                            or target.with_name(f"{target.stem}_images")
+                        )
+                        result = await self._download_telegraph_pdf(
+                            str(metadata_context.get("link_url", "") or ""),
+                            target,
+                            image_dir,
+                            semaphore,
+                            request.file_download_interval,
+                            request.save_telegraph_images,
+                        )
+                        metadata_context = dict(metadata_context)
+                        metadata_context["telegraph_image_count"] = result
+                        success = bool(result and target.exists())
+                    else:
+                        success = await self._download_media(
+                            client,
+                            message,
+                            target,
+                            semaphore,
+                            request.file_download_interval,
+                            chunk_concurrency=request.chunk_concurrency,
+                        )
                     if success and media_key:
                         self._remember_media_download(media_key, target)
                     if success:
@@ -807,7 +744,7 @@ class TelegramWorker(QThread):
             target: Path,
             metadata_context: dict[str, Any] | None = None,
         ) -> None:
-            media_key = self._media_key(message)
+            media_key = build_media_key(message)
             if request.skip_duplicates and media_key:
                 indexed_target = self._indexed_media_path(media_key, target)
                 if indexed_target:
@@ -819,7 +756,7 @@ class TelegramWorker(QThread):
                     return
             post_pending[post_id] = post_pending.get(post_id, 0) + 1
             try:
-                await download_queue.put((post_id, message, target, media_key, metadata_context or {}))
+                await download_queue.put(("telegram", post_id, message, target, media_key, metadata_context or {}))
                 if request.skip_duplicates and media_key:
                     pending_media_targets[media_key] = target
                 emit_metrics()
@@ -828,6 +765,107 @@ class TelegramWorker(QThread):
                     pending_media_targets.pop(media_key, None)
                 post_pending[post_id] = max(0, post_pending.get(post_id, 1) - 1)
                 raise
+
+        async def enqueue_telegraph_pdf(
+            source_post: Any,
+            source_message: Any,
+            target_dir: Path,
+        ) -> int:
+            """Download Telegraph instant-view comic pages as a single PDF."""
+            if not download_comics:
+                return 0
+            links = message_telegraph_links(source_message)
+            if not links:
+                return 0
+            source_post_id = int(source_post.id)
+            source_message_id = self._message_id(source_message) or source_post_id
+            source_tags = self._extract_hashtags(
+                str(getattr(source_message, "message", "") or "")
+            )
+            request_tag = request.tag.strip().lstrip("#")
+            if request_tag and request_tag not in source_tags:
+                source_tags.append(request_tag)
+
+            queued = 0
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for url in links:
+                media_key = telegraph_page_key(url)
+                if request.skip_duplicates and media_key:
+                    indexed_target = self._indexed_media_path(media_key)
+                    if indexed_target:
+                        record_file(source_post_id, indexed_target, False, "Telegraph 漫画页已下载过")
+                        continue
+                    pending_target = pending_media_targets.get(media_key)
+                    if pending_target:
+                        record_file(source_post_id, pending_target, False, "Telegraph 漫画页已在本次任务入队")
+                        continue
+
+                slug = safe_name(telegraph_slug(url), "telegraph", 72)
+                suffix = ".pdf"
+                stem_limit = max(1, min(request.filename_limit, 255 - len(suffix)))
+                page_name = safe_name(slug, f"telegraph_{source_post_id}", 96)
+                page_dir = target_dir / "漫画" / page_name
+                pdf_stem = safe_name(slug, "telegraph", stem_limit)
+                target = page_dir / f"{pdf_stem}{suffix}"
+                image_dir = page_dir / "images"
+                if target.exists() or target in reserved_targets:
+                    if request.skip_duplicates or request.duplicate_mode == "skip":
+                        record_file(source_post_id, target, False, "PDF 文件已存在")
+                        continue
+                    if request.duplicate_mode == "rename":
+                        target = self._available_target(target, reserved_targets)
+
+                reserved_targets.add(target)
+                post_pending[source_post_id] = post_pending.get(source_post_id, 0) + 1
+                try:
+                    await download_queue.put(
+                        (
+                            "telegraph",
+                            source_post_id,
+                            source_message,
+                            target,
+                            media_key,
+                            {
+                                "source": "telegraph",
+                                "parent_post": source_post
+                                if source_post is not source_message
+                                else None,
+                                "source_message": source_message,
+                                "link_text": "Telegraph",
+                                "link_url": url,
+                                "image_dir": str(image_dir),
+                                "extra_tags": source_tags,
+                            },
+                        )
+                    )
+                    if request.skip_duplicates and media_key:
+                        pending_media_targets[media_key] = target
+                    queued += 1
+                    emit_metrics()
+                except BaseException:
+                    if media_key and pending_media_targets.get(media_key) == target:
+                        pending_media_targets.pop(media_key, None)
+                    post_pending[source_post_id] = max(
+                        0, post_pending.get(source_post_id, 1) - 1
+                    )
+                    raise
+
+            if queued:
+                self.logger.debug(
+                    f"帖子 #{source_post_id}: Telegraph 漫画页已加入下载队列，共 {queued} 个"
+                )
+            return queued
+
+        def telegraph_count(messages: list[Any]) -> int:
+            if not download_comics:
+                return 0
+            seen: set[str] = set()
+            for message in messages:
+                if not message:
+                    continue
+                for url in message_telegraph_links(message):
+                    seen.add(telegraph_page_key(url))
+            return len(seen)
 
         async def enqueue_advanced_media(
             source_post_id: int,
@@ -982,6 +1020,11 @@ class TelegramWorker(QThread):
             target_dir = self._target_dir(request, channel_name, post_id)
             target_dir.mkdir(parents=True, exist_ok=True)
 
+            await enqueue_telegraph_pdf(parent_post, comment, target_dir)
+
+            if not download_images:
+                return
+
             if request.custom_extract_json and _HAS_EXTRACTOR:
                 adv_params = {
                     "save_root": str(target_dir),
@@ -1092,6 +1135,13 @@ class TelegramWorker(QThread):
                 and self._preview_cache_limits.get(cache_key, 0) >= request.max_posts
                 else None
             )
+            if cached_posts is not None and request.resume_post_ids:
+                selected_ids = {int(item) for item in request.resume_post_ids}
+                cached_posts = [
+                    item
+                    for item in cached_posts
+                    if int(item.get("post_id", 0) or 0) in selected_ids
+                ]
             if cached_posts is None and request.resume_post_ids:
                 resume_ids = list(dict.fromkeys(int(item) for item in request.resume_post_ids))
                 self.status_changed.emit(f"从恢复队列载入 {len(resume_ids)} 篇帖子…")
@@ -1123,14 +1173,28 @@ class TelegramWorker(QThread):
                 if request.resume_post_ids:
                     self.status_changed.emit("使用上次扫描恢复队列，继续处理未完成帖子")
                 else:
-                    self.status_changed.emit("使用搜索预览缓存，直接下载已发现图片")
+                    self.status_changed.emit("使用搜索预览缓存，直接下载已发现资源")
                 matched_posts = len(cached_posts)
                 planned_files = 0
-                if request.include_replies:
+                if download_images and request.include_replies:
                     planned_files += sum(
                         len(item.get("_media_messages", [])) for item in cached_posts
                     )
-                if request.extract_button_link and not (
+                if download_comics:
+                    planned_files += sum(
+                        telegraph_count(
+                            [
+                                item.get("_post"),
+                                *(
+                                    item.get("_comments") or []
+                                    if request.include_replies
+                                    else []
+                                ),
+                            ]
+                        )
+                        for item in cached_posts
+                    )
+                if download_images and request.extract_button_link and not (
                     request.custom_extract_json and _HAS_EXTRACTOR
                 ):
                     planned_files += sum(
@@ -1170,11 +1234,12 @@ class TelegramWorker(QThread):
 
                         begin_post(post)
                         self.status_changed.emit(f"正在检查帖子 #{post.id} 的正文链接与媒体")
+                        target_dir = self._target_dir(request, channel_name, post.id)
+                        await enqueue_telegraph_pdf(post, post, target_dir)
 
                         # ── 高级套娃提取路径 ──────────────────────────────
-                        if request.custom_extract_json and _HAS_EXTRACTOR:
+                        if download_images and request.custom_extract_json and _HAS_EXTRACTOR:
                             self.status_changed.emit(f"[高级模式] 正在深挖帖子 #{post.id}…")
-                            target_dir = self._target_dir(request, channel_name, post.id)
                             target_dir.mkdir(parents=True, exist_ok=True)
                             adv_params = {
                                 "save_root": str(target_dir),
@@ -1205,13 +1270,12 @@ class TelegramWorker(QThread):
                             await finish_post(post.id)
                             continue
                         # 跟随帖子正文或按钮中的 Telegram 链接，下载目标帖媒体。
-                        if request.extract_button_link and not (
+                        if download_images and request.extract_button_link and not (
                             request.custom_extract_json and _HAS_EXTRACTOR
                         ):
                             original_link = self._find_original_link(post, request.button_keyword)
                             if original_link:
                                 link_text, original_url = original_link
-                                target_dir = self._target_dir(request, channel_name, post.id)
                                 await enqueue_linked_media(
                                     post, link_text, original_url, target_dir
                                 )
@@ -1270,11 +1334,12 @@ class TelegramWorker(QThread):
                     matched_posts += 1
                     begin_post(post)
                     self.status_changed.emit(f"正在检查帖子 #{post.id} 的正文链接与媒体")
+                    target_dir = self._target_dir(request, channel_name, post.id)
+                    await enqueue_telegraph_pdf(post, post, target_dir)
 
                     # ── 高级套娃提取路径 ──────────────────────────────
-                    if request.custom_extract_json and _HAS_EXTRACTOR:
+                    if download_images and request.custom_extract_json and _HAS_EXTRACTOR:
                         self.status_changed.emit(f"[高级模式] 正在深挖帖子 #{post.id}…")
-                        target_dir = self._target_dir(request, channel_name, post.id)
                         target_dir.mkdir(parents=True, exist_ok=True)
                         adv_params = {
                             "save_root": str(target_dir),
@@ -1304,13 +1369,12 @@ class TelegramWorker(QThread):
                             self.logger.error(f"高级提取失败 #{post.id}: {_adv_exc}")
                         await finish_post(post.id)
                         continue
-                    if request.extract_button_link and not (
+                    if download_images and request.extract_button_link and not (
                         request.custom_extract_json and _HAS_EXTRACTOR
                     ):
                         original_link = self._find_original_link(post, request.button_keyword)
                         if original_link:
                             link_text, original_url = original_link
-                            target_dir = self._target_dir(request, channel_name, post.id)
                             await enqueue_linked_media(
                                 post, link_text, original_url, target_dir
                             )
@@ -1342,6 +1406,7 @@ class TelegramWorker(QThread):
                 emit_metrics(True)
 
             await download_queue.join()
+            self._save_media_index_if_needed(force=True)
 
             self.logger.task_completed(
                 matched_posts, downloaded, skipped, self.cancel_event.is_set()
@@ -1385,6 +1450,7 @@ class TelegramWorker(QThread):
                 await download_queue.put(None)
             if download_workers:
                 await asyncio.gather(*download_workers, return_exceptions=True)
+            self._save_media_index_if_needed(force=True)
 
     async def _preview(self, client: TelegramClient, request: PreviewRequest) -> None:
         self.preview_started.emit()
@@ -1402,6 +1468,7 @@ class TelegramWorker(QThread):
             request.include_replies,
             request.extract_button_link,
             request.button_keyword,
+            request.resource_mode,
             request.custom_extract_json,
             request.date_from,
             request.date_to,
@@ -1423,6 +1490,11 @@ class TelegramWorker(QThread):
         results: list[dict[str, Any]] = []
         total_count = 0
         preview_complete = True
+        resource_mode = str(getattr(request, "resource_mode", "images") or "images")
+        if resource_mode not in {"images", "comics", "both"}:
+            resource_mode = "images"
+        download_images = resource_mode in {"images", "both"}
+        download_comics = resource_mode in {"comics", "both"}
         try:
             channel_ref, entity = await resolve_channel_entity(client, request.channel)
             await self._emit_channel_info(client, entity, channel_ref)
@@ -1472,28 +1544,63 @@ class TelegramWorker(QThread):
                 media_messages: list[Any] = []
                 hit_sources: list[str] = []
                 debug_trace: list[str] = [f"A 帖子 #{post.id}"]
+                webpage_count = 0
+                webpage_keys: set[str] = set()
+                post_telegraph_links = (
+                    message_telegraph_links(post)
+                    if download_comics
+                    else []
+                )
+                for url in post_telegraph_links:
+                    key = telegraph_page_key(url)
+                    if key in webpage_keys:
+                        continue
+                    webpage_keys.add(key)
+                    webpage_count += 1
+                    debug_trace.append(f"Telegraph 漫画页 -> {url}")
+                if post_telegraph_links:
+                    hit_sources.append("Telegraph 漫画页命中")
                 body_link = (
                     self._find_original_link(post, request.button_keyword)
-                    if request.extract_button_link
+                    if download_images and request.extract_button_link
                     else None
                 )
-                has_tg_link = bool(body_link or self._telegram_post_links(post))
+                has_tg_link = download_images and bool(
+                    body_link or self._telegram_post_links(post)
+                )
                 if body_link:
                     hit_sources.append("正文链接命中")
                     debug_trace.append(f"正文链接「{body_link[0]}」 -> {body_link[1]}")
-                if request.custom_extract_json and has_tg_link:
+                if download_images and request.custom_extract_json and has_tg_link:
                     hit_sources.append("高级规则命中")
                     debug_trace.append("高级规则会继续深挖正文/评论区中的 Telegram 链接")
-                self.preview_progress.emit(f"正在检查帖子 #{post.id} 的评论图片…")
+                self.preview_progress.emit(f"正在检查帖子 #{post.id} 的评论与链接…")
                 try:
                     async for comment in client.iter_messages(entity, reply_to=post.id):
                         if self.preview_cancel_event.is_set():
                             preview_complete = False
                             break
                         comments.append(comment)
+                        comment_telegraph_links = (
+                            message_telegraph_links(comment)
+                            if download_comics
+                            else []
+                        )
+                        for url in comment_telegraph_links:
+                            key = telegraph_page_key(url)
+                            if key in webpage_keys:
+                                continue
+                            webpage_keys.add(key)
+                            webpage_count += 1
+                            debug_trace.append(f"评论 #{comment.id} Telegraph 漫画页 -> {url}")
+                        if (
+                            comment_telegraph_links
+                            and "评论区 Telegraph 命中" not in hit_sources
+                        ):
+                            hit_sources.append("评论区 Telegraph 命中")
                         comment_link = (
                             self._find_original_link(comment, request.button_keyword)
-                            if request.extract_button_link
+                            if download_images and request.extract_button_link
                             else None
                         )
                         if comment_link and "评论区链接命中" not in hit_sources:
@@ -1501,7 +1608,7 @@ class TelegramWorker(QThread):
                             debug_trace.append(
                                 f"评论 #{comment.id} 链接「{comment_link[0]}」 -> {comment_link[1]}"
                             )
-                        if not is_image_message(comment):
+                        if not download_images or not is_image_message(comment):
                             continue
                         image_count += 1
                         media_messages.append(comment)
@@ -1531,6 +1638,7 @@ class TelegramWorker(QThread):
                             getattr(getattr(post, "replies", None), "replies", 0) or 0
                         ),
                         "image_count": image_count,
+                        "webpage_count": webpage_count,
                         "hit_sources": hit_sources,
                         "debug_trace": debug_trace,
                         "thumbnails": thumbnails,
@@ -1618,7 +1726,7 @@ class TelegramWorker(QThread):
     async def _thumbnail_bytes(self, client: TelegramClient, message: Any) -> bytes | None:
         if is_webpage_preview(message) or is_sticker_message(message):
             return None
-        cache_key = self._media_key(message)
+        cache_key = build_media_key(message)
         now = time.time()
         if cache_key:
             cached = self._thumbnail_cache.get(cache_key)
@@ -1779,106 +1887,39 @@ class TelegramWorker(QThread):
             await asyncio.sleep(file_download_interval)
         return success
 
-    def _load_media_index(self, save_root: Path) -> None:
-        """Load per-save-root media ids used for duplicate detection."""
-        self._downloaded_media_index_path = save_root / ".tg_pic_collector_media.json"
-        self._downloaded_media_keys = set()
-        self._downloaded_media_paths = {}
-        try:
-            if self._downloaded_media_index_path.exists():
-                payload = json.loads(self._downloaded_media_index_path.read_text(encoding="utf-8"))
-                self._downloaded_media_keys = {
-                    str(item) for item in payload.get("media_keys", []) if item
-                }
-                media_paths = payload.get("media_paths", {})
-                if isinstance(media_paths, dict):
-                    self._downloaded_media_paths = {
-                        str(key): str(value)
-                        for key, value in media_paths.items()
-                        if key and value
-                    }
-                    self._downloaded_media_keys.update(self._downloaded_media_paths)
-        except (OSError, ValueError, TypeError):
-            self._downloaded_media_keys = set()
-            self._downloaded_media_paths = {}
+    async def _download_telegraph_pdf(
+        self,
+        url: str,
+        target: Path,
+        image_dir: Path,
+        semaphore: asyncio.Semaphore,
+        file_download_interval: float,
+        keep_images: bool = False,
+    ) -> int:
+        async with semaphore:
+            result = await download_telegraph_comic_async(
+                url,
+                target,
+                image_dir,
+                proxy_url=self.credentials.proxy_url,
+                use_system_proxy=self.credentials.use_system_proxy,
+                keep_images=keep_images,
+            )
+        if file_download_interval > 0:
+            await asyncio.sleep(file_download_interval)
+        return result.image_count
 
-    def _save_media_index(self) -> None:
-        if not self._downloaded_media_index_path:
-            return
-        try:
-            self._downloaded_media_index_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(
-                {
-                    "version": 2,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                    "media_keys": sorted(self._downloaded_media_keys),
-                    "media_paths": {
-                        key: self._downloaded_media_paths[key]
-                        for key in sorted(self._downloaded_media_paths)
-                    },
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            tmp_path = self._downloaded_media_index_path.with_name(
-                f"{self._downloaded_media_index_path.name}.tmp"
-            )
-            tmp_path.write_text(
-                payload,
-                encoding="utf-8",
-            )
-            tmp_path.replace(self._downloaded_media_index_path)
-        except OSError:
-            pass
+    def _load_media_index(self, save_root: Path) -> None:
+        self._media_index.load(save_root)
+
+    def _save_media_index_if_needed(self, *, force: bool = False) -> None:
+        self._media_index.save_if_needed(force=force)
 
     def _indexed_media_path(self, media_key: str, fallback_target: Path | None = None) -> Path | None:
-        if not media_key:
-            return None
-        root = self._downloaded_media_index_path.parent if self._downloaded_media_index_path else None
-        raw_path = self._downloaded_media_paths.get(media_key, "")
-        if raw_path and root:
-            candidate = Path(raw_path)
-            if not candidate.is_absolute():
-                candidate = root / candidate
-            if candidate.exists():
-                return candidate
-            self._downloaded_media_paths.pop(media_key, None)
-            self._downloaded_media_keys.discard(media_key)
-            self._save_media_index()
-        if fallback_target and media_key in self._downloaded_media_keys:
-            if fallback_target.exists():
-                return fallback_target
-            self._downloaded_media_keys.discard(media_key)
-            self._save_media_index()
-        return None
+        return self._media_index.indexed_path(media_key, fallback_target)
 
     def _remember_media_download(self, media_key: str, target: Path) -> None:
-        if not media_key or not target.exists():
-            return
-        self._downloaded_media_keys.add(media_key)
-        root = self._downloaded_media_index_path.parent if self._downloaded_media_index_path else None
-        stored_path = str(target)
-        if root:
-            try:
-                stored_path = str(target.resolve().relative_to(root.resolve()))
-            except (OSError, ValueError):
-                stored_path = str(target.resolve())
-        self._downloaded_media_paths[media_key] = stored_path
-        self._save_media_index()
-
-    @staticmethod
-    def _media_key(message: Any) -> str:
-        """Stable Telegram media identity used for cross-task duplicate checks."""
-        media = getattr(message, "media", None)
-        document = getattr(media, "document", None) or getattr(message, "document", None)
-        if document and getattr(document, "id", None):
-            return f"doc:{document.id}"
-        photo = getattr(media, "photo", None) or getattr(message, "photo", None)
-        if photo and getattr(photo, "id", None):
-            return f"photo:{photo.id}"
-        peer_id = getattr(getattr(message, "peer_id", None), "channel_id", "")
-        message_id = getattr(message, "id", "")
-        return f"msg:{peer_id}:{message_id}" if message_id else ""
+        self._media_index.remember(media_key, target)
 
     @staticmethod
     def _message_text(message: Any, limit: int = 5000) -> str:

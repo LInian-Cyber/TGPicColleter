@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'TG Pic Collector'),
           StringStruct('FileDescription', 'Telegram 评论区图片下载器'),
-          StringStruct('FileVersion', '2.4.3'),
+          StringStruct('FileVersion', '2.5.0'),
           StringStruct('InternalName', 'TG Pic Collector'),
           StringStruct('OriginalFilename', 'TG Pic Collector.exe'),
           StringStruct('ProductName', 'TG Pic Collector'),
-          StringStruct('ProductVersion', '2.4.3')
+          StringStruct('ProductVersion', '2.5.0')
         ]
       )
     ]),

@@ -38,7 +38,7 @@ class MainWindow(FluentWindow):
     task_delete_requested = Signal(int)
     task_preview_requested = Signal(dict)
     task_preview_cancel_requested = Signal()
-    task_preview_download_requested = Signal()
+    task_preview_download_requested = Signal(list)
     task_pause_all_requested = Signal()
     task_clear_queue_requested = Signal()
     tray_pause_requested = Signal()

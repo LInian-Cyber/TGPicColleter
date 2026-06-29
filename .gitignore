@@ -9,6 +9,12 @@ htmlcov/
 __pycache__/
 *.py[cod]
 *.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 .env
 .env.*
 

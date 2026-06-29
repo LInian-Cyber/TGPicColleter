@@ -23,7 +23,15 @@ from tg_pic_collector.network import (
     urllib_proxy_map,
     yande_proxy_warning,
 )
+from tg_pic_collector.telegraph import (
+    create_pdf_from_images,
+    download_telegraph_comic,
+    extract_telegraph_image_urls,
+    message_telegraph_links,
+    request_url,
+)
 from tg_pic_collector.telegram_worker import TelegramWorker, is_image_message, safe_name
+from tg_pic_collector.ui_views.task import TaskPage
 from tg_pic_collector.yande_worker import _post_id_from_text, _safe_filename
 
 
@@ -46,6 +54,33 @@ def fake_image_message(
         date=date,
         buttons=None,
     )
+
+
+class FakeComboBox:
+    def __init__(self, rows: list[tuple[str, str]]) -> None:
+        self.rows = rows
+        self._text = ""
+
+    def text(self) -> str:
+        return self._text
+
+    def setText(self, value: str) -> None:
+        self._text = value
+
+    def count(self) -> int:
+        return len(self.rows)
+
+    def itemText(self, index: int) -> str:
+        return self.rows[index][0]
+
+    def itemData(self, index: int) -> str:
+        return self.rows[index][1]
+
+    def findText(self, text: str) -> int:
+        for index, (item_text, _) in enumerate(self.rows):
+            if item_text == text:
+                return index
+        return -1
 
 
 class TelegramWorkerHelperTests(TestCase):
@@ -130,6 +165,73 @@ class TelegramWorkerHelperTests(TestCase):
     def test_yande_post_id_can_be_read_from_unencoded_tags_url(self) -> None:
         self.assertEqual(_post_id_from_text("https://yande.re/post?tags=id:12345"), 12345)
 
+    def test_media_index_writes_are_batched_until_flush(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "cats" / "photo.jpg"
+            image.parent.mkdir()
+            image.write_bytes(b"image")
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", root / "session")
+            )
+            worker._load_media_index(root)
+
+            worker._remember_media_download("doc:1", image)
+
+            unflushed = TelegramWorker(
+                TelegramCredentials(1, "hash", "", root / "session")
+            )
+            unflushed._load_media_index(root)
+            self.assertFalse((root / ".tg_pic_collector_media.json").exists())
+            self.assertNotIn("doc:1", unflushed._media_index.paths)
+
+            worker._save_media_index_if_needed(force=True)
+            reloaded = TelegramWorker(
+                TelegramCredentials(1, "hash", "", root / "session")
+            )
+            reloaded._load_media_index(root)
+
+            self.assertTrue((root / ".tg_pic_collector_media.sqlite3").exists())
+            self.assertEqual(
+                reloaded._media_index.paths["doc:1"],
+                str(Path("cats") / "photo.jpg"),
+            )
+
+    def test_media_index_flush_writes_only_dirty_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = root / "old.jpg"
+            image = root / "cats" / "photo.jpg"
+            image.parent.mkdir()
+            existing.write_bytes(b"old")
+            image.write_bytes(b"image")
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", root / "session")
+            )
+            worker._load_media_index(root)
+            worker._media_index.keys = {"doc:old"}
+            worker._media_index.paths = {"doc:old": "old.jpg"}
+            worker._media_index.save()
+
+            worker._remember_media_download("doc:1", image)
+            store = worker._media_index._store
+            assert store is not None
+            with (
+                patch.object(
+                    store,
+                    "replace",
+                    side_effect=AssertionError("media index flush should be incremental"),
+                ),
+                patch.object(store, "upsert", wraps=store.upsert) as upsert,
+            ):
+                worker._save_media_index_if_needed(force=True)
+
+            self.assertEqual(upsert.call_count, 1)
+            self.assertEqual(
+                upsert.call_args.args[0],
+                {"doc:1": str(Path("cats") / "photo.jpg")},
+            )
+
 
     def test_matching_button_url_is_found_case_insensitively(self) -> None:
         message = SimpleNamespace(
@@ -165,6 +267,148 @@ class TelegramWorkerHelperTests(TestCase):
                 target.read_text(encoding="utf-8"),
                 "[InternetShortcut]\nURL=https://example.com/image.jpg\n",
             )
+
+    def test_telegraph_links_are_found_from_webpage_preview(self) -> None:
+        message = SimpleNamespace(
+            message="",
+            buttons=None,
+            media=SimpleNamespace(
+                webpage=SimpleNamespace(url="https://telegra.ph/Demo-Comic-06-29")
+            ),
+        )
+
+        self.assertEqual(
+            message_telegraph_links(message),
+            ["https://telegra.ph/Demo-Comic-06-29"],
+        )
+
+    def test_telegraph_html_images_are_normalized_and_deduped(self) -> None:
+        html = """
+        <article>
+            <img src="/file/a.jpg">
+            <img src="https://telegra.ph/file/a.jpg">
+            <source srcset="/file/b.webp 1x, /file/c.png 2x">
+        </article>
+        """
+
+        self.assertEqual(
+            extract_telegraph_image_urls("https://telegra.ph/Demo-Comic", html),
+            [
+                "https://telegra.ph/file/a.jpg",
+                "https://telegra.ph/file/b.webp",
+                "https://telegra.ph/file/c.png",
+            ],
+        )
+
+    def test_telegraph_meta_cover_is_kept_before_body_images(self) -> None:
+        html = """
+        <head>
+            <meta property="og:image" content="/file/cover.jpg">
+            <meta name="twitter:image" content="/file/cover.jpg">
+        </head>
+        <article>
+            <img src="/file/page-001.jpg">
+            <img src="/file/page-002.jpg">
+        </article>
+        """
+
+        self.assertEqual(
+            extract_telegraph_image_urls("https://telegra.ph/Demo-Comic", html),
+            [
+                "https://telegra.ph/file/cover.jpg",
+                "https://telegra.ph/file/page-001.jpg",
+                "https://telegra.ph/file/page-002.jpg",
+            ],
+        )
+
+    def test_telegraph_request_url_quotes_non_ascii_path(self) -> None:
+        self.assertEqual(
+            request_url("https://telegra.ph/铃木先辈-06-29?title=百合"),
+            "https://telegra.ph/%E9%93%83%E6%9C%A8%E5%85%88%E8%BE%88-06-29?title=%E7%99%BE%E5%90%88",
+        )
+
+    def test_telegraph_request_url_keeps_existing_escapes(self) -> None:
+        self.assertEqual(
+            request_url("https://telegra.ph/%E9%93%83%E6%9C%A8-06-29"),
+            "https://telegra.ph/%E9%93%83%E6%9C%A8-06-29",
+        )
+
+    def test_telegraph_images_can_be_combined_to_pdf(self) -> None:
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "001.jpg"
+            second = root / "002.png"
+            Image.new("RGB", (4, 6), "white").save(first)
+            Image.new("RGB", (5, 7), "black").save(second)
+
+            pdf = root / "comic.pdf"
+            create_pdf_from_images([first, second], pdf)
+
+            self.assertTrue(pdf.exists())
+            self.assertGreater(pdf.stat().st_size, 0)
+
+    def test_telegraph_download_removes_source_images_by_default(self) -> None:
+        from PIL import Image
+        from io import BytesIO
+
+        class FakeHeaders:
+            def __init__(self, content_type: str) -> None:
+                self._content_type = content_type
+
+            def get_content_charset(self):
+                return "utf-8"
+
+            def get_content_type(self):
+                return self._content_type
+
+        class FakeResponse:
+            def __init__(self, payload: bytes, content_type: str) -> None:
+                self._payload = payload
+                self.headers = FakeHeaders(content_type)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self._payload
+
+        image_buffer = BytesIO()
+        Image.new("RGB", (4, 6), "white").save(image_buffer, format="JPEG")
+        image_bytes = image_buffer.getvalue()
+
+        class FakeOpener:
+            def open(self, request, timeout=0):
+                url = request.full_url
+                if url.endswith("/Demo-Comic"):
+                    return FakeResponse(
+                        b'<meta property="og:image" content="/file/cover.jpg">',
+                        "text/html",
+                    )
+                return FakeResponse(image_bytes, "image/jpeg")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "comic.pdf"
+            image_dir = root / "images"
+            with patch(
+                "tg_pic_collector.telegraph._build_opener",
+                return_value=FakeOpener(),
+            ):
+                result = download_telegraph_comic(
+                    "https://telegra.ph/Demo-Comic",
+                    pdf,
+                    image_dir,
+                )
+
+            self.assertTrue(pdf.exists())
+            self.assertFalse(image_dir.exists())
+            self.assertEqual(result.image_count, 1)
+            self.assertEqual(result.image_paths, ())
 
     def test_igp_package_contains_original_image_and_metadata(self) -> None:
         with TemporaryDirectory() as directory:
@@ -204,6 +448,22 @@ class TelegramWorkerHelperTests(TestCase):
 
         self.assertIn(b"iTXt", embedded_bytes)
         self.assertIn(b"IGP", embedded_bytes)
+
+
+class TaskPageChannelDisplayTests(TestCase):
+    def test_private_channel_id_uses_display_name_but_submits_real_id(self) -> None:
+        page = TaskPage.__new__(TaskPage)
+        page.channel_combo = FakeComboBox(
+            [("Private Gallery  ·  https://t.me/c/2578315790", "-1002578315790")]
+        )
+
+        page.set_channel_value("-1002578315790")
+
+        self.assertEqual(
+            page.channel_combo.text(),
+            "Private Gallery  ·  https://t.me/c/2578315790",
+        )
+        self.assertEqual(page._get_channel_input(), "-1002578315790")
 
 
 class NetworkProxyTests(TestCase):
@@ -477,6 +737,44 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
         self.assertNotIn("_post", rows[0])
         self.assertNotIn("_media_messages", rows[0])
 
+    async def test_preview_counts_telegraph_comics_when_selected(self) -> None:
+        post = SimpleNamespace(
+            id=42,
+            message="#cats https://telegra.ph/Demo-Comic-06-29",
+            date=datetime(2026, 6, 10, tzinfo=timezone.utc),
+            views=120,
+            replies=SimpleNamespace(replies=0),
+            buttons=None,
+        )
+
+        class FakeClient:
+            async def get_entity(self, _):
+                return SimpleNamespace(title="Demo Channel", username="demo")
+
+            def iter_messages(self, _, search=None, limit=None, reply_to=None, **_kwargs):
+                async def items():
+                    if reply_to is None:
+                        yield post
+
+                return items()
+
+        worker = TelegramWorker(
+            TelegramCredentials(1, "hash", "", Path("test-session"))
+        )
+        rows = []
+        worker.preview_finished.connect(
+            lambda preview_rows, _total, _limit: rows.extend(preview_rows)
+        )
+
+        await worker._preview(
+            FakeClient(),
+            PreviewRequest("@demo", "#cats", max_posts=10, resource_mode="comics"),
+        )
+
+        self.assertEqual(rows[0]["image_count"], 0)
+        self.assertEqual(rows[0]["webpage_count"], 1)
+        self.assertIn("Telegraph 漫画页命中", rows[0]["hit_sources"])
+
     async def test_scan_uses_preview_media_cache_without_rescanning_comments(self) -> None:
         post = SimpleNamespace(
             id=42,
@@ -540,6 +838,162 @@ class TelegramPreviewTests(IsolatedAsyncioTestCase):
 
         self.assertEqual(plans, [(1, 1)])
         self.assertEqual(progress[-1][:2], (1, 0))
+
+    async def test_preview_download_filters_cached_posts_by_selected_ids(self) -> None:
+        posts = [
+            SimpleNamespace(id=42, message="#cats first", replies=SimpleNamespace(replies=1)),
+            SimpleNamespace(id=43, message="#cats second", replies=SimpleNamespace(replies=1)),
+        ]
+        images = [fake_image_message(101, name="first.jpg"), fake_image_message(102, name="second.jpg")]
+        downloaded: list[int] = []
+
+        class FakeClient:
+            async def get_entity(self, _):
+                return SimpleNamespace(title="Demo Channel", username="demo", id=1)
+
+            async def download_profile_photo(self, *_args, **_kwargs):
+                return b""
+
+            def iter_messages(self, *_args, **_kwargs):
+                raise AssertionError("selected preview download must use cached rows only")
+
+            async def get_messages(self, *_args, **_kwargs):
+                raise AssertionError("selected cached rows should not be refetched")
+
+            async def download_media(self, message, file):
+                downloaded.append(int(message.id))
+                Path(file).write_bytes(b"\xff\xd8\xff\xd9")
+                return file
+
+        with TemporaryDirectory() as directory:
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", Path(directory) / "session")
+            )
+            cache_key = ("@demo", "#cats", "", "")
+            worker._preview_cache[cache_key] = [
+                {
+                    "post_id": 42,
+                    "image_count": 1,
+                    "_post": posts[0],
+                    "_comments": [images[0]],
+                    "_media_messages": [images[0]],
+                },
+                {
+                    "post_id": 43,
+                    "image_count": 1,
+                    "_post": posts[1],
+                    "_comments": [images[1]],
+                    "_media_messages": [images[1]],
+                },
+            ]
+            worker._preview_cache_limits[cache_key] = 10
+            plans = []
+            worker.scan_plan_ready.connect(lambda posts, total: plans.append((posts, total)))
+
+            await worker._scan(
+                FakeClient(),
+                ScanRequest(
+                    "@demo",
+                    "#cats",
+                    Path(directory),
+                    "tag",
+                    max_posts=10,
+                    resume_post_ids=(43,),
+                    file_download_interval=0,
+                ),
+            )
+
+        self.assertEqual(plans, [(1, 1)])
+        self.assertEqual(downloaded, [102])
+
+    async def test_scan_comic_mode_downloads_telegraph_pdf_without_media_download(self) -> None:
+        post = SimpleNamespace(
+            id=42,
+            message="#cats https://telegra.ph/Demo-Comic-06-29",
+            replies=SimpleNamespace(replies=0),
+            buttons=None,
+        )
+
+        class FakeClient:
+            async def get_entity(self, _):
+                return SimpleNamespace(title="Demo Channel", username="demo", id=1)
+
+            async def download_profile_photo(self, *_args, **_kwargs):
+                return b""
+
+            def iter_messages(self, *_args, **_kwargs):
+                raise AssertionError("cached comic scan must not iterate messages")
+
+            async def get_messages(self, *_args, **_kwargs):
+                raise AssertionError("cached comic scan must not refetch the post")
+
+            async def download_media(self, *_args, **_kwargs):
+                raise AssertionError("comic mode must not download Telegram media")
+
+        async def fake_download(url, pdf_path, image_dir, **kwargs):
+            self.assertEqual(url, "https://telegra.ph/Demo-Comic-06-29")
+            self.assertFalse(kwargs.get("keep_images", True))
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            return SimpleNamespace(image_count=1)
+
+        with TemporaryDirectory() as directory:
+            worker = TelegramWorker(
+                TelegramCredentials(1, "hash", "", Path(directory) / "session")
+            )
+            cache_key = ("@demo", "#cats", "", "")
+            worker._preview_cache[cache_key] = [
+                {
+                    "post_id": 42,
+                    "image_count": 0,
+                    "webpage_count": 1,
+                    "_post": post,
+                    "_comments": [],
+                    "_media_messages": [],
+                }
+            ]
+            worker._preview_cache_limits[cache_key] = 10
+            plans = []
+            progress = []
+            worker.scan_plan_ready.connect(lambda posts, total: plans.append((posts, total)))
+            worker.scan_progress.connect(
+                lambda downloaded, skipped, location: progress.append(
+                    (downloaded, skipped, location)
+                )
+            )
+
+            with patch(
+                "tg_pic_collector.telegram_worker.download_telegraph_comic_async",
+                new=fake_download,
+            ):
+                await worker._scan(
+                    FakeClient(),
+                    ScanRequest(
+                        "@demo",
+                        "#cats",
+                        Path(directory),
+                        "tag",
+                        max_posts=10,
+                        include_replies=False,
+                        resource_mode="comics",
+                        file_download_interval=0,
+                    ),
+                )
+
+            pdf = (
+                Path(directory)
+                / "cats"
+                / "漫画"
+                / "Demo-Comic-06-29"
+                / "Demo-Comic-06-29.pdf"
+            )
+            pdf_exists = pdf.exists()
+            image_dir_exists = (pdf.parent / "images").exists()
+
+        self.assertEqual(plans, [(1, 1)])
+        self.assertEqual(progress[-1][:2], (1, 0))
+        self.assertTrue(pdf_exists)
+        self.assertFalse(image_dir_exists)
 
     async def test_scan_skips_duplicate_media_indexed_in_another_folder(self) -> None:
         post = SimpleNamespace(
@@ -793,6 +1247,141 @@ class AppConfigTests(TestCase):
         self.assertEqual((config.channel_history or [])[0]["id"], "@channel24")
         self.assertEqual((config.channel_history or [])[0]["name"], "Updated")
 
+    def test_runtime_config_fields_are_migrated_to_store(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_dir = Path(directory)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "api_id": "123",
+                        "history": [
+                            {
+                                "channel": "@demo",
+                                "tag": "cats",
+                                "status": "done",
+                                "downloaded": 2,
+                                "time": "2026-06-28 12:00",
+                            }
+                        ],
+                        "yande_tag_history": ["blue_archive"],
+                        "last_task_state": {"status": "running"},
+                        "channel_history": [{"id": "@demo", "name": "Demo"}],
+                        "account_sessions": [
+                            {
+                                "key": "::default",
+                                "session_name": "default",
+                                "session_dir": "",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                AppConfig,
+                "config_dir",
+                new_callable=PropertyMock,
+                return_value=config_dir,
+            ):
+                config = AppConfig.load()
+                config.save()
+                reloaded = AppConfig.load()
+
+            saved_payload = json.loads(
+                (config_dir / "config.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(config.history[0]["channel"], "@demo")
+        self.assertEqual(reloaded.yande_tag_history, ["blue_archive"])
+        self.assertEqual(reloaded.last_task_state, {"status": "running"})
+        self.assertEqual((reloaded.channel_history or [])[0]["id"], "@demo")
+        self.assertEqual((reloaded.account_sessions or [])[0]["key"], "::default")
+        for field in (
+            "history",
+            "yande_tag_history",
+            "last_task_state",
+            "channel_history",
+            "account_sessions",
+        ):
+            self.assertNotIn(field, saved_payload)
+
+    def test_runtime_only_save_does_not_rewrite_config_json(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_dir = Path(directory)
+            with patch.object(
+                AppConfig,
+                "config_dir",
+                new_callable=PropertyMock,
+                return_value=config_dir,
+            ):
+                config = AppConfig(api_id="123")
+                config.save()
+                before = (config_dir / "config.json").read_text(encoding="utf-8")
+
+                config.last_task_state = {"status": "running", "downloaded": 1}
+                config.save_runtime_fields("last_task_state")
+                after = (config_dir / "config.json").read_text(encoding="utf-8")
+                reloaded = AppConfig.load()
+
+        self.assertEqual(after, before)
+        self.assertEqual(
+            reloaded.last_task_state,
+            {"status": "running", "downloaded": 1},
+        )
+
+    def test_save_skips_unchanged_config_json_write(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_dir = Path(directory)
+            with patch.object(
+                AppConfig,
+                "config_dir",
+                new_callable=PropertyMock,
+                return_value=config_dir,
+            ):
+                config = AppConfig(api_id="123")
+                config.save()
+
+                with patch.object(
+                    Path,
+                    "write_text",
+                    side_effect=AssertionError("unchanged config should not write"),
+                ):
+                    config.save()
+
+    def test_save_skips_unchanged_runtime_store_replace(self) -> None:
+        with TemporaryDirectory() as directory:
+            config_dir = Path(directory)
+            with patch.object(
+                AppConfig,
+                "config_dir",
+                new_callable=PropertyMock,
+                return_value=config_dir,
+            ):
+                config = AppConfig(
+                    api_id="123",
+                    history=[{"channel": "@demo", "downloaded": 1}],
+                )
+                config.save()
+                store = config.store
+
+                with patch.object(
+                    store,
+                    "replace_history",
+                    wraps=store.replace_history,
+                ) as replace_history:
+                    config.save()
+                    self.assertEqual(replace_history.call_count, 0)
+
+                    config.history = [
+                        *(config.history or []),
+                        {"channel": "@next", "downloaded": 2},
+                    ]
+                    config.save()
+                    self.assertEqual(replace_history.call_count, 1)
+
+                    config.save()
+                    self.assertEqual(replace_history.call_count, 1)
+
 
 class ControllerResumeStateTests(TestCase):
     def test_resumable_post_ids_exclude_completed_posts(self) -> None:
@@ -812,3 +1401,15 @@ class ControllerResumeStateTests(TestCase):
             AppController._resumable_post_ids({"post_ids": ["42", "bad", 43]}),
             [42, 43],
         )
+
+    def test_read_log_tail_returns_only_recent_lines(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "app.log"
+            path.write_text(
+                "\n".join(f"line {index}" for index in range(500)),
+                encoding="utf-8",
+            )
+
+            tail = AppController._read_log_tail(path, max_lines=3, max_bytes=4096)
+
+        self.assertEqual(tail.splitlines(), ["line 497", "line 498", "line 499"])

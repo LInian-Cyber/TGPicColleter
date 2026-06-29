@@ -66,6 +66,7 @@ class ScanRequest:
     button_keyword: str = "原图"
     only_images: bool = True
     include_replies: bool = True
+    resource_mode: str = "images"  # images | comics | both
     concurrency: int = 6
     file_download_interval: float = 0.5
     filename_limit: int = 100
@@ -73,6 +74,7 @@ class ScanRequest:
     custom_extract_json: str = ""             # 高级套娃提取规则 JSON（空字符串=不启用）
     chunk_concurrency: int = 1               # 单文件分片并发数（1=关闭分片，建议 2-8）
     save_extended_info: bool = False
+    save_telegraph_images: bool = False
     date_from: str = ""
     date_to: str = ""
 
@@ -88,6 +90,7 @@ class PreviewRequest:
     include_replies: bool = True
     extract_button_link: bool = True
     button_keyword: str = "原图"
+    resource_mode: str = "images"
     custom_extract_json: str = ""
     date_from: str = ""
     date_to: str = ""

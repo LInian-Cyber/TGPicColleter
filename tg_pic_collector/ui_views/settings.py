@@ -346,6 +346,18 @@ class SettingsPage(ScrollPage):
         auto_open.body.addLayout(ao_row)
         grid.addWidget(auto_open, 1, 1)
 
+        comic_images = SurfaceCard("Telegraph 漫画单页原图", "关闭时只保留 PDF，合成后自动清理临时单页图片。")
+        comic_row = QHBoxLayout()
+        comic_text = QVBoxLayout()
+        comic_text.addWidget(StrongBodyLabel("保留每张原始图片"))
+        comic_text.addWidget(_muted("默认关闭；开启后会在每个漫画目录保留 images 子目录。"))
+        comic_row.addLayout(comic_text, 1)
+        self.save_telegraph_images_sw = SwitchButton()
+        self.save_telegraph_images_sw.setChecked(False)
+        comic_row.addWidget(self.save_telegraph_images_sw)
+        comic_images.body.addLayout(comic_row)
+        grid.addWidget(comic_images, 2, 0, 1, 2)
+
         layout.addLayout(grid)
         layout.addStretch()
         return w
@@ -686,6 +698,7 @@ class SettingsPage(ScrollPage):
         self._close_remember_radios[False].setChecked(True)
         self.use_system_proxy_sw.setChecked(True)
         self.proxy_url_edit.clear()
+        self.save_telegraph_images_sw.setChecked(False)
 
     def _collect(self) -> dict:
         mode = self.mode_combo.currentData() or "channel_tag"
@@ -722,6 +735,7 @@ class SettingsPage(ScrollPage):
             "theme_mode": theme,
             "lang": self.lang_combo.currentData() or "zh_CN",
             "open_after_download": self.auto_open_sw.isChecked(),
+            "save_telegraph_images": self.save_telegraph_images_sw.isChecked(),
             "use_dpapi_encryption": self.encrypt_sw.isChecked(),
         }
 
@@ -800,6 +814,8 @@ class SettingsPage(ScrollPage):
                 self._summary_fn_lbl.setText("文件命名规则\n优先保留原名")
         if "open_after_download" in d:
             self.auto_open_sw.setChecked(bool(d["open_after_download"]))
+        if "save_telegraph_images" in d:
+            self.save_telegraph_images_sw.setChecked(bool(d["save_telegraph_images"]))
         if "lang" in d:
             idx = self.lang_combo.findData(d["lang"])
             if idx >= 0:

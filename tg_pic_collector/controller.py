@@ -3,21 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication
 from qfluentwidgets import Theme, setTheme
 
 from .config import AppConfig
-from .igp import (
-    UnsupportedMetadataFormat,
-    create_igp_package,
-    default_sidecar_path,
-    discover_sidecar_pairs,
-    embed_metadata_file,
-    image_path_from_sidecar,
-    validate_sidecar_pair,
-)
+from .controller_export import ExportControllerMixin
+from .controller_yande import NetworkTestWorker, YandeControllerMixin
 from .logger import get_logger
 from .models import (
     PreviewRequest,
@@ -26,26 +19,11 @@ from .models import (
     TelegramCredentials,
     normalize_channel_reference,
 )
-from .network import run_network_diagnostics
 from .telegram_worker import TelegramWorker
 from .ui import HistoryRow, MainWindow, TaskRow
-from .yande_worker import YandeWorker
 
 
-class NetworkTestWorker(QThread):
-    result_ready = Signal(bool, str)
-
-    def __init__(self, proxy_url: str, use_system_proxy: bool, parent=None):
-        super().__init__(parent)
-        self.proxy_url = proxy_url
-        self.use_system_proxy = use_system_proxy
-
-    def run(self) -> None:
-        ok, message = run_network_diagnostics(self.proxy_url, self.use_system_proxy)
-        self.result_ready.emit(ok, message)
-
-
-class AppController(QObject):
+class AppController(ExportControllerMixin, YandeControllerMixin, QObject):
     """Connects the pure UI layer to configuration and Telegram services."""
 
     def __init__(self, config: AppConfig) -> None:
@@ -93,7 +71,7 @@ class AppController(QObject):
         self.window.set_channel_cache_rows(channel_history)
 
         if self.config.channel:
-            self.window.task_page.channel_combo.setText(self.config.channel)
+            self.window.task_page.set_channel_value(self.config.channel)
         if self.config.restore_on_launch:
             self.window.task_page.tag_edit.setText(self.config.tag)
             if self.config.last_task_state:
@@ -168,6 +146,7 @@ class AppController(QObject):
             "remember_close_behavior": self.config.remember_close_behavior,
             "use_dpapi_encryption": self.config.use_dpapi_encryption,
             "save_extended_info": self.config.save_extended_info,
+            "save_telegraph_images": self.config.save_telegraph_images,
             "use_system_proxy": self.config.use_system_proxy,
             "proxy_url": self.config.proxy_url,
         }
@@ -235,279 +214,6 @@ class AppController(QObject):
             return
         QDesktopServices.openUrl(path.as_uri())
 
-    @staticmethod
-    def _available_export_path(path: Path) -> Path:
-        if not path.exists():
-            return path
-        for index in range(2, 10000):
-            candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
-            if not candidate.exists():
-                return candidate
-        return path.with_name(f"{path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{path.suffix}")
-
-    def _single_export_pair(self, target: Path) -> tuple[Path, Path]:
-        sidecar_image = image_path_from_sidecar(target)
-        if sidecar_image is not None:
-            image_path = sidecar_image
-            sidecar_path = target
-        else:
-            image_path = target
-            sidecar_path = default_sidecar_path(image_path)
-        validate_sidecar_pair(image_path, sidecar_path, strict_name=True)
-        return image_path, sidecar_path
-
-    def _export_text(self, zh: str, en: str) -> str:
-        return en if getattr(self.window, "_language", "zh_CN") == "en_US" else zh
-
-    def export_images(self, params: dict) -> None:
-        source_raw = str(params.get("source_path", "")).strip()
-        if not source_raw:
-            self.window.show_error("请先选择来源")
-            return
-        source_path = Path(source_raw).expanduser().resolve()
-        if not source_path.exists():
-            self.window.show_error("来源不存在")
-            return
-
-        mode = str(params.get("mode", "igp")).strip()
-        if mode not in {"igp", "metadata"}:
-            self.window.show_error("导出模式无效")
-            return
-
-        try:
-            if source_path.is_dir():
-                pairs, orphan_images, orphan_sidecars = discover_sidecar_pairs(
-                    source_path,
-                    recursive=bool(params.get("recursive", False)),
-                )
-            else:
-                pairs = [self._single_export_pair(source_path)]
-                orphan_images = 0
-                orphan_sidecars = 0
-        except (OSError, ValueError) as exc:
-            self.window.show_error(str(exc))
-            return
-
-        skipped = orphan_images + orphan_sidecars
-        if not pairs:
-            summary = self._export_text(
-                f"没有找到可导出的匹配文件。跳过不匹配 {skipped} 个。",
-                f"No matched files found. Skipped {skipped} unmatched files.",
-            )
-            self.window.set_export_result(summary, [])
-            self.window.show_error("没有找到可导出的匹配文件")
-            return
-
-        output_raw = str(params.get("output_path", "")).strip()
-        output_dir = Path(output_raw).expanduser().resolve() if output_raw else None
-        if output_dir is not None:
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-        igp_options = dict(params.get("igp_options", {}) or {})
-        metadata_sections = igp_options.get("metadata_sections")
-        include_checksums = bool(igp_options.get("include_checksums", True))
-
-        rows: list[dict] = []
-        succeeded = 0
-        failed = 0
-        for image_path, sidecar_path in pairs:
-            target_dir = output_dir or image_path.parent
-            target_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                if mode == "igp":
-                    output_path = self._available_export_path(target_dir / f"{image_path.stem}.igp")
-                    result = create_igp_package(
-                        image_path,
-                        sidecar_path,
-                        output_path,
-                        metadata_sections=metadata_sections,
-                        include_checksums=include_checksums,
-                    )
-                    mode_label = "IGP"
-                else:
-                    output_path = self._available_export_path(
-                        target_dir / f"{image_path.stem}.igpmeta{image_path.suffix}"
-                    )
-                    result = embed_metadata_file(image_path, sidecar_path, output_path)
-                    mode_label = self._export_text("元数据", "Metadata")
-                succeeded += 1
-                rows.append(
-                    {
-                        "file": image_path.name,
-                        "mode": mode_label,
-                        "status": self._export_text("成功", "Done"),
-                        "output": str(result),
-                        "message": "",
-                    }
-                )
-            except (OSError, ValueError, UnsupportedMetadataFormat) as exc:
-                failed += 1
-                rows.append(
-                    {
-                        "file": image_path.name,
-                        "mode": "IGP" if mode == "igp" else self._export_text("元数据", "Metadata"),
-                        "status": self._export_text("失败", "Failed"),
-                        "output": "",
-                        "message": str(exc),
-                    }
-                )
-
-        summary = self._export_text(
-            f"导出完成：成功 {succeeded}，失败 {failed}，跳过不匹配 {skipped}。",
-            f"Export complete: {succeeded} succeeded, {failed} failed, {skipped} unmatched skipped.",
-        )
-        self.window.set_export_result(summary, rows)
-        if failed:
-            self.window.show_info("导出完成，部分文件失败")
-        else:
-            self.window.show_success("导出完成")
-
-    def preview_yande(self, params: dict) -> None:
-        if self.yande_worker and self.yande_worker.isRunning():
-            self.window.show_info("Yande 任务正在运行，请稍候")
-            return
-        params = self._with_network_params(params)
-        self._save_yande_params(params)
-        self.window.set_yande_busy(True)
-        self.window.set_yande_progress(0, 1, "正在从 yande.re 读取帖子…")
-        self.yande_worker = YandeWorker(params, mode="preview")
-        self.yande_worker.rows_ready.connect(self.window.set_yande_rows)
-        self.yande_worker.progress.connect(self._on_yande_progress)
-        self.yande_worker.finished.connect(lambda summary: self._on_yande_finished(summary, "preview", params))
-        self.yande_worker.failed.connect(self._on_yande_failed)
-        self.yande_worker.start()
-
-    def download_yande(self, params: dict) -> None:
-        if self.yande_worker and self.yande_worker.isRunning():
-            self.window.show_info("Yande 任务正在运行，请稍候")
-            return
-        params = self._with_network_params(params)
-        if not str(params.get("save_root", "")).strip():
-            self.window.show_error("请先设置 Yande 保存目录")
-            return
-        rating = str(params.get("rating", "all"))
-        if rating == "explicit" and not str(params.get("cookie", "")).strip():
-            self.window.show_info("Explicit 内容通常需要 Yande 登录态 Cookie，未填写时可能没有结果")
-        self._save_yande_params(params)
-        self.window.set_yande_busy(True)
-        has_preview_rows = bool(params.get("rows"))
-        self.window.set_yande_progress(
-            0,
-            1,
-            "正在下载当前预览结果…" if has_preview_rows else "正在搜索并准备 Yande 下载…",
-        )
-        self.yande_worker = YandeWorker(params, mode="download")
-        self.yande_worker.rows_ready.connect(self.window.set_yande_rows)
-        self.yande_worker.row_updated.connect(self._on_yande_row_updated)
-        self.yande_worker.progress.connect(self._on_yande_progress)
-        self.yande_worker.finished.connect(lambda summary: self._on_yande_finished(summary, "download", params))
-        self.yande_worker.failed.connect(self._on_yande_failed)
-        self.yande_worker.start()
-
-    def _with_network_params(self, params: dict) -> dict:
-        params = dict(params)
-        params["proxy_url"] = self.config.proxy_url
-        params["use_system_proxy"] = self.config.use_system_proxy
-        return params
-
-    def test_network_proxy(self, values: dict) -> None:
-        if self.network_test_worker and self.network_test_worker.isRunning():
-            self.window.show_info("网络代理测试正在运行，请稍候")
-            return
-        proxy_url = str(values.get("proxy_url", "") or "").strip()
-        use_system_proxy = bool(values.get("use_system_proxy", True))
-        self.window.show_info("正在测试网络代理…")
-        worker = NetworkTestWorker(proxy_url, use_system_proxy, self)
-        self.network_test_worker = worker
-        worker.result_ready.connect(self._on_network_test_finished)
-        worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(lambda: setattr(self, "network_test_worker", None))
-        worker.start()
-
-    def _on_network_test_finished(self, ok: bool, message: str) -> None:
-        self.logger.info(f"网络代理测试结果: {message.replace(chr(10), ' | ')}")
-        if ok:
-            self.window.show_success(f"网络代理测试通过：{message}")
-        else:
-            self.window.show_error(f"网络代理测试未通过：{message}")
-
-    def cancel_yande(self) -> None:
-        if self.yande_worker and self.yande_worker.isRunning():
-            self.yande_worker.cancel()
-            self.window.set_yande_progress(0, 1, "正在停止 Yande 任务…")
-
-    def _on_yande_progress(self, completed: int, total: int, message: str) -> None:
-        self.window.set_yande_progress(completed, total, message)
-        self._refresh_log_view()
-
-    def _on_yande_row_updated(self, index: int, status: str, message: str) -> None:
-        self.window.update_yande_row(index, status, message)
-        self._refresh_log_view()
-
-    def _save_yande_params(self, params: dict) -> None:
-        tags = str(params.get("tags", "") or "").strip()
-        self.config.yande_tags = tags
-        self.config.save_root = str(params.get("save_root", self.config.save_root) or self.config.save_root)
-        current_cookie = str(params.get("cookie", "") or "").strip()
-        if bool(params.get("remember_cookie")):
-            self.config.yande_cookie = current_cookie
-        if tags:
-            self.config.add_yande_tag_history(tags)
-        else:
-            self.config.save()
-        self.window.set_yande_defaults(
-            self.config.save_root,
-            self.config.yande_cookie if bool(params.get("remember_cookie")) else current_cookie,
-            self.config.yande_tags,
-            list(self.config.yande_tag_history or []),
-        )
-
-    def _on_yande_finished(self, summary: dict, mode: str, params: dict) -> None:
-        self.window.set_yande_busy(False)
-        total = int(summary.get("total", 0) or 0)
-        downloaded = int(summary.get("downloaded", 0) or 0)
-        skipped = int(summary.get("skipped", 0) or 0)
-        failed = int(summary.get("failed", 0) or 0)
-        cancelled = bool(summary.get("cancelled"))
-        if mode == "preview":
-            self.window.set_yande_progress(total, max(1, total), f"预览完成：找到 {total} 条。")
-            self._refresh_log_view()
-            if not total:
-                self.window.show_info("Yande 没有找到匹配结果")
-            return
-
-        status = "已取消" if cancelled else ("失败" if failed and not downloaded else "已完成")
-        self.config.add_history(
-            {
-                "channel": "yande.re",
-                "tag": str(params.get("tags", "") or "未分类"),
-                "status": status,
-                "posts": total,
-                "downloaded": downloaded,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "save_root": summary.get("save_root", params.get("save_root", self.config.save_root)),
-            }
-        )
-        self._refresh_local_data()
-        self.window.set_yande_progress(
-            downloaded + skipped + failed,
-            max(1, total),
-            f"Yande 下载结束：下载 {downloaded}，跳过 {skipped}，失败 {failed}。",
-        )
-        if cancelled:
-            self.window.show_info("Yande 下载已停止")
-        elif failed:
-            self.window.show_info("Yande 下载完成，部分文件失败")
-        else:
-            self.window.show_success("Yande 下载完成")
-        self._refresh_log_view()
-
-    def _on_yande_failed(self, message: str) -> None:
-        self.window.set_yande_busy(False)
-        self.window.set_yande_progress(0, 1, f"Yande 任务失败：{message}")
-        self.window.show_error(f"Yande 任务失败：{message}")
-        self._refresh_log_view()
-
     def clear_queue(self) -> None:
         if self.worker and self.worker.isRunning():
             self._discard_current_task = True
@@ -567,7 +273,7 @@ class AppController(QObject):
                 continue
             kept.append(item)
         self.config.channel_history = kept
-        self.config.save()
+        self.config.save_runtime_fields("channel_history")
         rows = self._combined_channel_history(self._loaded_dialogs)
         self.window.task_page.add_channel_history(rows)
         self.window.set_channel_cache_rows(rows)
@@ -582,7 +288,7 @@ class AppController(QObject):
                 except OSError:
                     pass
         self.config.channel_history = []
-        self.config.save()
+        self.config.save_runtime_fields("channel_history")
         rows = self._combined_channel_history(self._loaded_dialogs)
         self.window.task_page.add_channel_history(rows)
         self.window.set_channel_cache_rows(rows)
@@ -787,6 +493,7 @@ class AppController(QObject):
         self.window.task_page.add_channel_history(
             self._combined_channel_history(self._loaded_dialogs)
         )
+        self.window.task_page.set_channel_value(channel_id)
         self.window.set_channel_cache_rows(
             self._combined_channel_history(self._loaded_dialogs)
         )
@@ -883,6 +590,9 @@ class AppController(QObject):
                 resume_post_ids.append(int(item))
             except (TypeError, ValueError):
                 continue
+        resource_mode = str(params.get("resource_mode", "images") or "images")
+        if resource_mode not in {"images", "comics", "both"}:
+            resource_mode = "images"
         request = ScanRequest(
             channel=channel,
             tag=params.get("tag", ""),
@@ -897,6 +607,7 @@ class AppController(QObject):
             button_keyword=str(params.get("button_keyword", "")).strip() or "原图",
             only_images=bool(params.get("only_images", True)),
             include_replies=bool(params.get("include_replies", True)),
+            resource_mode=resource_mode,
             concurrency=max(1, int(self.config.concurrency)),
             file_download_interval=max(0.0, float(self.config.file_download_interval)),
             filename_limit=max(20, int(self.config.filename_limit)),
@@ -904,6 +615,7 @@ class AppController(QObject):
             custom_extract_json=str(params.get("custom_extract_json", "")).strip(),
             chunk_concurrency=max(1, min(8, int(self.config.chunk_concurrency))),
             save_extended_info=bool(params.get("save_extended_info", False)),
+            save_telegraph_images=bool(self.config.save_telegraph_images),
             date_from=str(params.get("date_from", "") or ""),
             date_to=str(params.get("date_to", "") or ""),
             resume_post_ids=tuple(dict.fromkeys(resume_post_ids)),
@@ -1045,6 +757,9 @@ class AppController(QObject):
     def start_preview(self, params: dict) -> None:
         channel = normalize_channel_reference(str(params.get("channel", "")))
         tag = str(params.get("tag", "")).strip()
+        resource_mode = str(params.get("resource_mode", "images") or "images")
+        if resource_mode not in {"images", "comics", "both"}:
+            resource_mode = "images"
         if not channel:
             self.window.show_error("请先填写要搜索的频道、用户名或 ID")
             return
@@ -1071,17 +786,29 @@ class AppController(QObject):
                 include_replies=bool(params.get("include_replies", True)),
                 extract_button_link=bool(params.get("extract_button_link", True)),
                 button_keyword=str(params.get("button_keyword", "")).strip() or "原图",
+                resource_mode=resource_mode,
                 custom_extract_json=str(params.get("custom_extract_json", "")).strip(),
                 date_from=str(params.get("date_from", "") or ""),
                 date_to=str(params.get("date_to", "") or ""),
             )
         )
 
-    def start_preview_download(self) -> None:
+    def start_preview_download(self, selected_post_ids: list[int] | None = None) -> None:
         if not self._last_preview_params:
             self.window.show_info("暂无可直接下载的预览任务")
             return
-        self.start_task(dict(self._last_preview_params))
+        selected_ids = []
+        for item in selected_post_ids or []:
+            try:
+                selected_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if not selected_ids:
+            self.window.show_info("请先勾选要下载的预览结果")
+            return
+        params = dict(self._last_preview_params)
+        params["resume_post_ids"] = list(dict.fromkeys(selected_ids))
+        self.start_task(params)
 
     def cancel_preview(self) -> None:
         if self.worker:
@@ -1207,7 +934,7 @@ class AppController(QObject):
             }
         )
         self.config.last_task_state = state
-        self.config.save()
+        self.config.save_runtime_fields("last_task_state")
 
     def _on_scan_metrics_changed(self, metrics: dict) -> None:
         downloaded = int(metrics.get("downloaded", 0))
@@ -1251,7 +978,7 @@ class AppController(QObject):
             state["post_statuses"] = post_statuses
             state["updated_at"] = datetime.now().isoformat(timespec="seconds")
             self.config.last_task_state = state
-            self.config.save()
+            self.config.save_runtime_fields("last_task_state")
         completed = sum(
             1 for value in task.post_statuses.values() if value.startswith("已完成")
         )
@@ -1301,7 +1028,7 @@ class AppController(QObject):
                 }
             )
             self.config.last_task_state = state
-            self.config.save()
+            self.config.save_runtime_fields("last_task_state")
         if self.current_request and not self._discard_current_task:
             self.config.add_history(
                 {
@@ -1366,7 +1093,7 @@ class AppController(QObject):
                 }
             )
             self.config.last_task_state = state
-            self.config.save()
+            self.config.save_runtime_fields("last_task_state")
         self._refresh_log_view()
         if not self._discard_current_task:
             self.window.show_error(f"任务失败：{message}")
@@ -1430,6 +1157,9 @@ class AppController(QObject):
         self.config.use_dpapi_encryption = bool(values.get("use_dpapi_encryption", True))
         self.config.save_extended_info = bool(
             values.get("save_extended_info", self.config.save_extended_info)
+        )
+        self.config.save_telegraph_images = bool(
+            values.get("save_telegraph_images", self.config.save_telegraph_images)
         )
         self.config.use_system_proxy = bool(
             values.get("use_system_proxy", self.config.use_system_proxy)
@@ -1498,7 +1228,7 @@ class AppController(QObject):
 
     def clear_history(self) -> None:
         self.config.history = []
-        self.config.save()
+        self.config.save_runtime_fields("history")
         self._refresh_local_data()
         self.window.show_success("下载历史已清空")
 
@@ -1508,7 +1238,7 @@ class AppController(QObject):
             return
         history.pop(index)
         self.config.history = history
-        self.config.save()
+        self.config.save_runtime_fields("history")
         self._refresh_local_data()
         self.window.show_success("历史记录已删除")
 
@@ -1530,14 +1260,27 @@ class AppController(QObject):
         path.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(path.as_uri())
 
+    @staticmethod
+    def _read_log_tail(path: Path, max_lines: int = 300, max_bytes: int = 128 * 1024) -> str:
+        if not path.exists():
+            return ""
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as fh:
+                offset = max(0, size - max_bytes)
+                fh.seek(offset)
+                data = fh.read()
+            text = data.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            if offset > 0 and lines:
+                lines = lines[1:]
+            return "\n".join(lines[-max_lines:])
+        except OSError:
+            return "无法读取日志文件。"
+
     def _refresh_log_view(self) -> None:
         path = self.logger.get_log_path().resolve()
-        try:
-            content = path.read_text(encoding="utf-8") if path.exists() else ""
-        except OSError:
-            content = "无法读取日志文件。"
-        lines = content.splitlines()
-        self.window.set_log(str(path), "\n".join(lines[-300:]))
+        self.window.set_log(str(path), self._read_log_tail(path))
 
     def _refresh_local_data(self) -> None:
         history = self.config.history or []
